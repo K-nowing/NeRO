@@ -101,7 +101,7 @@ class Trainer:
         self.best_pth_fn = os.path.join(self.model_dir, 'model_best.pth')
 
     def run(self):
-        self._init_dataset()
+        self._init_dataset() # ?? is thif?
         self._init_network()
         self._init_logger()
 

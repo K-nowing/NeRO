@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataset.database import parse_database_name, get_database_split, BaseDatabase
+from dataset.database import parse_database_name, get_database_split, BaseDatabase, NeRFSyntheticDatabase
 from network.field import SDFNetwork, SingleVarianceNetwork, NeRFNetwork, AppShadingNetwork, get_intersection, \
     extract_geometry, sample_pdf, MCShadingNetwork
 from utils.base_utils import color_map_forward, downsample_gaussian_blur
@@ -159,19 +159,42 @@ class NeROShapeRenderer(nn.Module):
 
     def _init_dataset(self):
         # train/test split
-        self.database = parse_database_name(self.cfg['database_name'], self.cfg['dataset_dir'])
-        self.train_ids, self.test_ids = get_database_split(self.database)
-        self.train_ids = np.asarray(self.train_ids)
+        if self.cfg['database_name'].split('/')[0] == 'nerf':
+            self.train_database = NeRFSyntheticDatabase(self.cfg['database_name'], self.cfg['dataset_dir'], self.cfg['img_wh'], 'train')
+            self.train_ids = self.train_database.get_img_ids()
+            self.train_ids = np.asarray(self.train_ids)
+            
+            self.train_imgs_info = build_imgs_info(self.train_database, self.train_ids, self.is_nerf)
+            self.train_imgs_info = imgs_info_to_torch(self.train_imgs_info, 'cpu')
+            b, _, h, w = self.train_imgs_info['imgs'].shape
+            print(f'training size {h} {w} ...')
+            self.train_num = len(self.train_ids)
+            
+            self.test_database = NeRFSyntheticDatabase(self.cfg['database_name'], self.cfg['dataset_dir'], self.cfg['img_wh'], 'val', val_num=4)
+            self.test_ids = self.test_database.get_img_ids()
+            self.test_ids = np.asarray(self.test_ids)
+            
+            self.test_imgs_info = build_imgs_info(self.test_database, self.test_ids, self.is_nerf)
+            self.test_imgs_info = imgs_info_to_torch(self.test_imgs_info, 'cpu')
+            b, _, h, w = self.test_imgs_info['imgs'].shape
+            print(f'valid size {h} {w} ...')
+            self.test_num = len(self.test_ids)
+            
+        else:
+            self.train_database = parse_database_name(self.cfg['database_name'], self.cfg['dataset_dir'])
+            self.train_ids, self.test_ids = get_database_split(self.train_database)
+            self.train_ids = np.asarray(self.train_ids)
 
-        self.train_imgs_info = build_imgs_info(self.database, self.train_ids, self.is_nerf)
-        self.train_imgs_info = imgs_info_to_torch(self.train_imgs_info, 'cpu')
-        b, _, h, w = self.train_imgs_info['imgs'].shape
-        print(f'training size {h} {w} ...')
-        self.train_num = len(self.train_ids)
+            self.train_imgs_info = build_imgs_info(self.train_database, self.train_ids, self.is_nerf)
+            self.train_imgs_info = imgs_info_to_torch(self.train_imgs_info, 'cpu')
+            b, _, h, w = self.train_imgs_info['imgs'].shape
+            print(f'training size {h} {w} ...')
+            self.train_num = len(self.train_ids)
 
-        self.test_imgs_info = build_imgs_info(self.database, self.test_ids, self.is_nerf)
-        self.test_imgs_info = imgs_info_to_torch(self.test_imgs_info, 'cpu')
-        self.test_num = len(self.test_ids)
+            self.test_database = self.train_database
+            self.test_imgs_info = build_imgs_info(self.test_database, self.test_ids, self.is_nerf)
+            self.test_imgs_info = imgs_info_to_torch(self.test_imgs_info, 'cpu')
+            self.test_num = len(self.test_ids)
 
         # clean the data if we already have
         if hasattr(self, 'train_batch'):
@@ -389,7 +412,7 @@ class NeROShapeRenderer(nn.Module):
     def test_step(self, index, step, ):
         target_imgs_info, target_img_ids = self.test_imgs_info, self.test_ids
         imgs_info = imgs_info_slice(target_imgs_info, torch.from_numpy(np.asarray([index], np.int64)))
-        gt_depth, gt_mask = self.database.get_depth(target_img_ids[index])  # used in evaluation
+        gt_depth, gt_mask = self.test_database.get_depth(target_img_ids[index])  # used in evaluation
         is_nerf = self.is_nerf
         if self.cfg['test_downsample_ratio']:
             imgs_info = imgs_info_downsample(imgs_info, self.cfg['downsample_ratio'])

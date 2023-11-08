@@ -24,7 +24,7 @@ key_metric_name: psnr
 
 ####dataset#####
 train_dataset_type: dummy
-dataset_dir: your_dataset_dir
+dataset_dir: data/blender
 train_dataset_cfg:
   database_name: nerf/materials
   dataset_dir:

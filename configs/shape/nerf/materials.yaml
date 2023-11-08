@@ -16,9 +16,10 @@ freeze_inv_s_step: 15000
 
 ####dataset#####
 train_dataset_type: dummy
-dataset_dir: your_dataset_dir
+dataset_dir: data/blender
 train_dataset_cfg:
   database_name: nerf/materials
+img_wh: [800,800]
 val_set_list:
   -
     name: val

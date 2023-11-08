@@ -409,60 +409,49 @@ class CustomDatabase(BaseDatabase):
 
 
 class NeRFSyntheticDatabase(BaseDatabase):
-    def __init__(self, database_name, dataset_dir, testskip=8):
+    def __init__(self, database_name, dataset_dir, img_wh=[800,800], split='train', val_num=4):
         super().__init__(database_name)
         _, model_name = database_name.split('/')
+        self.split = split
         RENDER_ROOT = dataset_dir
         # RENDER_ROOT = '/media/data_nix/yzy/Git_Project/data/nerf_synthetic'
         self.root = f'{RENDER_ROOT}/{model_name}'
         self.scale_factor = 1.0
 
-        splits = ['train', 'test']
-        metas = {}
-        for s in splits:
-            with open(os.path.join(self.root, 'transforms_{}.json'.format(s)), 'r') as fp:
-                metas[s] = json.load(fp)
+        with open(os.path.join(self.root, 'transforms_{}.json'.format(split)), 'r') as fp:
+            self.meta = json.load(fp)
 
         all_imgs = []
         all_poses = []
         counts = [0]
-        for s in splits:
-            meta = metas[s]
-            imgs = []
-            poses = []
-            if s == 'train' or testskip == 0:
-                skip = 1
-            else:
-                skip = testskip
 
-            for frame in meta['frames'][::skip]:
+        imgs = []
+        poses = []
+
+        if self.split in ['train', 'val']:
+            frame_list = self.meta['frames'] if 'train' else self.meta['frames'][:val_num]
+            for frame in frame_list:
                 fname = os.path.join(self.root, frame['file_path'] + '.png')
                 imgs.append(imageio.imread(fname))
                 poses.append(np.array(frame['transform_matrix']))
-            imgs = (np.array(imgs) / 255.).astype(np.float32)  # keep all 4 channels (RGBA)
-            poses = np.array(poses).astype(np.float32)
-            counts.append(counts[-1] + imgs.shape[0])
-            all_imgs.append(imgs)
-            all_poses.append(poses)
+            self.imgs = (np.array(imgs) / 255.).astype(np.float32)  # keep all 4 channels (RGBA)
+            self.poses = np.array(poses).astype(np.float32)
+            counts.append(counts[-1] + self.imgs.shape[0])
 
-        i_split = [np.arange(counts[i], counts[i + 1]) for i in range(2)]
+            # self.poses[..., :3, 3] /= 2  # near far bound to [-1, 1]
 
-        self.imgs = np.concatenate(all_imgs, 0)
-        self.poses = np.concatenate(all_poses, 0)
-        self.poses[..., :3, 3] /= 2
+            self.img_num = self.imgs.shape[0]
+            self.img_ids = [str(k) for k in range(self.img_num)]
 
-        self.img_num = self.imgs.shape[0]
-        self.img_ids = [str(k) for k in range(self.img_num)]
+            H, W = self.imgs[0].shape[:2]
 
-        H, W = self.imgs[0].shape[:2]
-
-        camera_angle_x = float(meta['camera_angle_x'])
-        focal = .5 * W / np.tan(.5 * camera_angle_x)
-        self.Ks = np.array([
-            [focal, 0, 0.5 * W],
-            [0, focal, 0.5 * H],
-            [0, 0, 1]
-        ])
+            camera_angle_x = float(self.meta['camera_angle_x'])
+            focal = .5 * W / np.tan(.5 * camera_angle_x)
+            self.Ks = np.array([
+                [focal, 0, 0.5 * W],
+                [0, focal, 0.5 * H],
+                [0, 0, 1]
+            ])
 
     def get_image(self, img_id):
         imgs = self.imgs[int(img_id)]
