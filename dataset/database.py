@@ -428,7 +428,7 @@ class NeRFSyntheticDatabase(BaseDatabase):
         imgs = []
         poses = []
 
-        if self.split in ['train', 'val']:
+        if self.split in ['train', 'val', 'test']:
             frame_list = self.meta['frames'] if 'train' else self.meta['frames'][:val_num]
             for frame in frame_list:
                 fname = os.path.join(self.root, frame['file_path'] + '.png')
@@ -438,7 +438,7 @@ class NeRFSyntheticDatabase(BaseDatabase):
             self.poses = np.array(poses).astype(np.float32)
             counts.append(counts[-1] + self.imgs.shape[0])
 
-            # self.poses[..., :3, 3] /= 2  # near far bound to [-1, 1]
+            self.poses[..., :3, 3] /= 2  # near far bound to [-1, 1]
 
             self.img_num = self.imgs.shape[0]
             self.img_ids = [str(k) for k in range(self.img_num)]

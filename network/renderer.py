@@ -170,7 +170,7 @@ class NeROShapeRenderer(nn.Module):
             print(f'training size {h} {w} ...')
             self.train_num = len(self.train_ids)
             
-            self.test_database = NeRFSyntheticDatabase(self.cfg['database_name'], self.cfg['dataset_dir'], self.cfg['img_wh'], 'val', val_num=4)
+            self.test_database = NeRFSyntheticDatabase(self.cfg['database_name'], self.cfg['dataset_dir'], self.cfg['img_wh'], 'test', val_num=4)
             self.test_ids = self.test_database.get_img_ids()
             self.test_ids = np.asarray(self.test_ids)
             
