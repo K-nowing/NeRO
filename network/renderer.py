@@ -836,7 +836,7 @@ class NeROShapeRenderer(nn.Module):
 
     def predict_materials(self):
         name = self.cfg['name']
-        mesh = open3d.io.read_triangle_mesh(f'data/meshes/{name}-300000.ply')
+        mesh = open3d.io.read_triangle_mesh(f'outputs/meshes/{name}-300000.ply')
         xyz = np.asarray(mesh.vertices)
         xyz = torch.from_numpy(xyz.astype(np.float32)).cuda()
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
@@ -864,7 +864,7 @@ class NeROMaterialRenderer(nn.Module):
         'is_nerf': False,
         'rgb_loss': 'charbonier',
 
-        'mesh': 'data/meshes/bear_shape-300000.ply',
+        'mesh': 'outputs/meshes/bear_shape-300000.ply',
 
         'shader_cfg': {},
 

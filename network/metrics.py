@@ -71,7 +71,7 @@ class ShapeRenderMetrics(Loss):
         # output image
         data_index = kwargs['data_index']
         model_name = kwargs['model_name']
-        output_path = Path(f'data/train_vis/{model_name}')
+        output_path = Path(f'outputs/train_vis/{model_name}')
         output_path.mkdir(exist_ok=True, parents=True)
         imsave(f'{str(output_path)}/{step}-index-{data_index}.jpg', concat_images_list(*imgs, vert=True))
         return outputs

@@ -14,7 +14,7 @@ def main():
     cfg = load_cfg(flags.cfg)
     network = name2renderer[cfg['network']](cfg, training=False)
 
-    ckpt = torch.load(f'data/model/{cfg["name"]}/model.pth')
+    ckpt = torch.load(f'outputs/model/{cfg["name"]}/model.pth')
     step = ckpt['step']
     network.load_state_dict(ckpt['network_state_dict'])
     network.eval().cuda()
@@ -29,7 +29,7 @@ def main():
 
     # output geometry
     mesh = trimesh.Trimesh(vertices, triangles)
-    output_dir = Path('data/meshes')
+    output_dir = Path('outputs/meshes')
     output_dir.mkdir(exist_ok=True)
     mesh.export(str(output_dir / f'{cfg["name"]}-{step}.ply'))
 

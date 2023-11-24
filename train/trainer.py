@@ -44,6 +44,7 @@ class Trainer:
         print(f'train set len {len(self.train_set)}')
         self.val_set_list, self.val_set_names = [], []
         dataset_dir = self.cfg['dataset_dir']
+        
         for val_set_cfg in self.cfg['val_set_list']:
             name, val_type, val_cfg = val_set_cfg['name'], val_set_cfg['type'], val_set_cfg['cfg']
             val_set = name2dataset[val_type](val_cfg, False, dataset_dir=dataset_dir)
@@ -95,7 +96,7 @@ class Trainer:
         np.random.seed(self.cfg['random_seed'])
         random.seed(self.cfg['random_seed'])
         self.model_name = cfg['name']
-        self.model_dir = os.path.join('data/model', cfg['name'])
+        self.model_dir = os.path.join('outputs/model', cfg['name'])
         if not os.path.exists(self.model_dir): Path(self.model_dir).mkdir(exist_ok=True, parents=True)
         self.pth_fn = os.path.join(self.model_dir, 'model.pth')
         self.best_pth_fn = os.path.join(self.model_dir, 'model_best.pth')
@@ -181,6 +182,37 @@ class Trainer:
             del loss, log_info
 
         pbar.close()
+
+    def test(self, save_dir):
+        import cv2
+        self._init_dataset()
+        self._init_network()
+        best_para, start_step = self._load_model()
+
+        # self.network.cfg['test_downsample_ratio'] = False
+        torch.cuda.empty_cache()
+        val_results = {}
+        val_para = 0
+        step = 0
+        os.makedirs(save_dir, exist_ok=True)
+        
+        for vi, val_set in enumerate(self.val_set_list):
+            eval_results, key_metric_val, outputs_dict = self.val_evaluator(
+                self.network, self.val_losses + self.val_metrics, val_set, step,
+                self.model_name, val_set_name=self.val_set_names[vi], return_outputs=True)
+
+            psnr = np.mean(eval_results['psnr'])
+            ssim = np.mean(eval_results['ssim'])
+            print(psnr)
+            print(ssim)
+            
+            for save_result_name in ['ray_rgb', 'normal', 'diffuse_albedo', 'diffuse_light', 'diffuse_color', 'specular_albedo', 'specular_light', 'specular_color', 'specular_ref', 'metallic', 'roughness', 'occ_prob', 'indirect_light', 'occ_prob_gt', 'loss_rgb', 'gt_rgb', 'gt_depth', 'gt_mask']:
+                for i, ret in enumerate(tqdm(outputs_dict[save_result_name][::20])):
+                    ret = ret.view(200,200, -1)
+                    ret = (ret*255).cpu().numpy()
+                    ret = ret[:,:,::-1].astype(np.uint8)
+                    num = str(i).zfill(3)
+                    cv2.imwrite(f'{save_dir}/{save_result_name}_{num}.png', ret)
 
     def _load_model(self):
         best_para, start_step = 0, 0

@@ -509,6 +509,8 @@ class AppShadingNetwork(nn.Module):
         'roughness_init': 0.0,
         'metallic_init': 0.0,
         'light_exp_max': 0.0,
+        'direct_light': True,
+        'indirect_light': True,
     }
 
     def __init__(self, cfg):
@@ -569,30 +571,44 @@ class AppShadingNetwork(nn.Module):
         return human_lights, human_weights
 
     def predict_specular_lights(self, points, feature_vectors, reflective, roughness, human_poses, step):
-        human_light, human_weight = 0, 0
         ref_roughness = self.sph_enc(reflective, roughness)
-        pts = self.pos_enc(points)
-        if self.cfg['sphere_direction']:
-            sph_points = offset_points_to_sphere(points)
-            sph_points = F.normalize(sph_points + reflective * get_sphere_intersection(sph_points, reflective), dim=-1)
-            sph_points = self.sph_enc(sph_points, roughness)
-            direct_light = self.outer_light(torch.cat([ref_roughness, sph_points], -1))
-        else:
-            direct_light = self.outer_light(ref_roughness)
-
+        human_light, human_weight = 0, 0
         if self.cfg['human_light']:
             human_light, human_weight = self.predict_human_light(points, reflective, human_poses, roughness)
+            
+        if self.cfg['direct_light']:
+            
+            if self.cfg['sphere_direction']:
+                sph_points = offset_points_to_sphere(points)
+                sph_points = F.normalize(sph_points + reflective * get_sphere_intersection(sph_points, reflective), dim=-1)
+                sph_points = self.sph_enc(sph_points, roughness)
+                direct_light = self.outer_light(torch.cat([ref_roughness, sph_points], -1))
+            else:
+                direct_light = self.outer_light(ref_roughness)
 
-        indirect_light = self.inner_light(torch.cat([pts, ref_roughness], -1))
-        ref_ = self.dir_enc(reflective)
-        occ_prob = self.inner_weight(torch.cat([pts.detach(), ref_.detach()], -1))  # this is occlusion prob
-        occ_prob = occ_prob * 0.5 + 0.5
-        occ_prob_ = torch.clamp(occ_prob, min=0, max=1)
+        if self.cfg['indirect_light']:
+            pts = self.pos_enc(points)
+            indirect_light = self.inner_light(torch.cat([pts, ref_roughness], -1))
+            
+        if self.cfg['direct_light'] and self.cfg['indirect_light']:
+            ref_ = self.dir_enc(reflective)
+            occ_prob = self.inner_weight(torch.cat([pts.detach(), ref_.detach()], -1))  # this is occlusion prob
+            occ_prob = occ_prob * 0.5 + 0.5
+            occ_prob_ = torch.clamp(occ_prob, min=0, max=1)
 
-        light = indirect_light * occ_prob_ + (human_light * human_weight + direct_light * (1 - human_weight)) * (
-                    1 - occ_prob_)
-        indirect_light = indirect_light * occ_prob_
-        return light, occ_prob, indirect_light, human_light * human_weight
+            light = indirect_light * occ_prob_ + (human_light * human_weight + direct_light * (1 - human_weight)) * (
+                        1 - occ_prob_)
+            indirect_light = indirect_light * occ_prob_
+        elif self.cfg['direct_light']:
+            light = human_light * human_weight + direct_light * (1 - human_weight)
+            occ_prob = torch.zeros((*light.shape[:-1], 1), device=light.device)
+            indirect_light = torch.zeros_like(light)
+        elif self.cfg['indirect_light']:
+            light = indirect_light + human_light * human_weight
+            occ_prob = torch.ones((*light.shape[:-1], 1), device=light.device)
+        else:
+            raise
+        return light, occ_prob, indirect_light, human_light * human_weight 
 
     def predict_diffuse_lights(self, points, feature_vectors, normals):
         roughness = torch.ones([normals.shape[0], 1])
@@ -732,6 +748,9 @@ class MCShadingNetwork(nn.Module):
 
         'random_azimuth': True,
         'is_real': False,
+        
+        'direct_light': True,
+        'indirect_light': True,
     }
 
     def __init__(self, cfg, ray_trace_fun):
@@ -890,20 +909,40 @@ class MCShadingNetwork(nn.Module):
             *shape)
         miss_mask = ~hit_mask
 
-        # hit_mask
-        lights = torch.zeros(*shape, 3)
-        human_lights, human_weights = torch.zeros([1, 3]), torch.zeros([1, 1])
-        if torch.sum(miss_mask) > 0:
-            outer_lights = self.predict_outer_lights(points[miss_mask], directions[miss_mask])
+        if self.cfg['direct_light'] and self.cfg['indirect_light']:
+            # hit_mask
+            lights = torch.zeros(*shape, 3)
+            human_lights, human_weights = torch.zeros([1, 3]), torch.zeros([1, 1])
+            if torch.sum(miss_mask) > 0:
+                outer_lights = self.predict_outer_lights(points[miss_mask], directions[miss_mask])
+                if self.cfg['human_lights']:
+                    human_lights, human_weights = self.get_human_light(points[miss_mask], directions[miss_mask],
+                                                                    human_poses[miss_mask])
+                else:
+                    human_lights, human_weights = torch.zeros_like(outer_lights), torch.zeros(outer_lights.shape[0], 1)
+                lights[miss_mask] = outer_lights * (1 - human_weights) + human_lights * human_weights
+
+            if torch.sum(hit_mask) > 0:
+                lights[hit_mask] = self.get_inner_lights(inters[hit_mask], -directions[hit_mask], normals[hit_mask])
+                
+        elif self.cfg['direct_light']:
+            lights = self.predict_outer_lights(points, directions)
             if self.cfg['human_lights']:
-                human_lights, human_weights = self.get_human_light(points[miss_mask], directions[miss_mask],
-                                                                   human_poses[miss_mask])
+                human_lights, human_weights = self.get_human_light(points, directions, human_poses)
             else:
                 human_lights, human_weights = torch.zeros_like(outer_lights), torch.zeros(outer_lights.shape[0], 1)
-            lights[miss_mask] = outer_lights * (1 - human_weights) + human_lights * human_weights
-
-        if torch.sum(hit_mask) > 0:
-            lights[hit_mask] = self.get_inner_lights(inters[hit_mask], -directions[hit_mask], normals[hit_mask])
+            lights = lights * (1 - human_weights) + human_lights * human_weights
+            
+        elif self.cfg['indirect_light']:
+            lights = self.get_inner_lights(inters, -directions, normals)
+            if self.cfg['human_lights']:
+                human_lights, human_weights = self.get_human_light(points, directions, human_poses)
+            else:
+                human_lights, human_weights = torch.zeros_like(outer_lights), torch.zeros(outer_lights.shape[0], 1)
+            lights = lights * (1 - human_weights) + human_lights * human_weights
+            
+        else:
+            raise
 
         near_mask = (depth > eps).float()
         lights = lights * near_mask  # very near surface does not bring lights
