@@ -1,0 +1,5 @@
+# ninja log v5
+174	19717	1700233127785987606	/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/ngp_nero/raymarching/build/temp.linux-x86_64-cpython-310/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/ngp_nero/raymarching/src/bindings.o	eafd857117b80e86
+174	54344	1700233162479620767	/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/ngp_nero/raymarching/build/temp.linux-x86_64-cpython-310/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/ngp_nero/raymarching/src/raymarching.o	31d9954b1934feda
+97	19527	1700815093981832934	/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/NeRO/raymarching/build/temp.linux-x86_64-cpython-310/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/NeRO/raymarching/src/bindings.o	4a44d9e88debc1b4
+98	53888	1700815128373456402	/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/NeRO/raymarching/build/temp.linux-x86_64-cpython-310/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/NeRO/raymarching/src/raymarching.o	1d231efdbe027c33
