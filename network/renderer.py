@@ -1,5 +1,5 @@
 import cv2
-
+import math
 import raytracing
 import open3d
 import numpy as np
@@ -15,18 +15,20 @@ from utils.raw_utils import linear_to_srgb
 
 from tqdm import trange
 
+import raymarching
 
-def build_imgs_info(database: BaseDatabase, img_ids, is_nerf=False):
+
+def build_imgs_info(database: BaseDatabase, img_ids, use_mask=False):
     images = [database.get_image(img_id) for img_id in img_ids]
     poses = [database.get_pose(img_id) for img_id in img_ids]
     Ks = [database.get_K(img_id) for img_id in img_ids]
 
     images = np.stack(images, 0)
-    if is_nerf:
+    if use_mask:
         masks = [database.get_depth(img_id)[1] for img_id in img_ids]
         masks = np.stack(masks, 0)
-    else:
-        images = color_map_forward(images).astype(np.float32)
+        images = images * masks[...,None] + 255 * (1 - masks[...,None])
+    images = color_map_forward(images).astype(np.float32)
     Ks = np.stack(Ks, 0).astype(np.float32)
     poses = np.stack(poses, 0).astype(np.float32)
 
@@ -36,7 +38,7 @@ def build_imgs_info(database: BaseDatabase, img_ids, is_nerf=False):
         'poses': poses,
     }
 
-    if is_nerf:
+    if use_mask:
         imgs_info['masks'] = masks
     
     return imgs_info
@@ -102,6 +104,19 @@ class NeROShapeRenderer(nn.Module):
         'shader_config': {},
 
         # sampling strategy
+        'raymarching': False,
+        ## raymarching
+        'num_rays': 2048,
+        'num_points': 2**18,
+        'adaptive_num_rays': True,
+        'grid_size': 128,
+        'density_thresh': 0.001,  # for sdf default
+        'trainable_density_grid': False,
+        'bound': 1.0,
+        'scale': 1.0,
+        'offset': [0.0, 0.0, 0.0],
+        'min_near': 0.05,
+        ## non raymarching
         'n_samples': 64,
         'n_bg_samples': 32,
         'inf_far': 1000.0,
@@ -115,7 +130,8 @@ class NeROShapeRenderer(nn.Module):
 
         # dataset
         'database_name': 'nerf_synthetic/lego/black_800',
-        'is_nerf': False,
+        'is_blender': False,
+        'use_mask': True,
 
         # validation
         'test_downsample_ratio': True,
@@ -135,7 +151,8 @@ class NeROShapeRenderer(nn.Module):
     def __init__(self, cfg, training=True):
         super().__init__()
         self.cfg = {**self.default_cfg, **cfg}
-        self.is_nerf = self.cfg['is_nerf']
+        self.is_blender = self.cfg['is_blender']
+        self.use_mask = True if self.is_blender or self.cfg['use_mask'] else False
 
         self.sdf_network = SDFNetwork(d_out=self.cfg['sdf_d_out'], d_in=3, d_hidden=256,
                                       n_layers=self.cfg['sdf_n_layers'],
@@ -147,12 +164,59 @@ class NeROShapeRenderer(nn.Module):
         self.deviation_network = SingleVarianceNetwork(init_val=self.cfg['inv_s_init'], activation=self.cfg['std_act'])
 
         # background nerf is a nerf++ model (this is outside the unit bounding sphere, so we call it outer nerf)
-        self.outer_nerf = NeRFNetwork(D=8, d_in=4, d_in_view=3, W=256, multires=10, multires_view=4, output_ch=4,
-                                      skips=[4], use_viewdirs=True)
-        nn.init.constant_(self.outer_nerf.rgb_linear.bias, np.log(0.5))
+        if not self.use_mask:
+            self.outer_nerf = NeRFNetwork(D=8, d_in=4, d_in_view=3, W=256, multires=10, multires_view=4, output_ch=4,
+                                        skips=[4], use_viewdirs=True)
+            nn.init.constant_(self.outer_nerf.rgb_linear.bias, np.log(0.5))
 
         self.color_network = AppShadingNetwork(self.cfg['shader_config'])
         self.sdf_inter_fun = lambda x: self.sdf_network.sdf(x)
+        
+        if self.cfg['raymarching']:
+            self.real_bound = self.cfg['bound']
+            # contract background
+            if self.real_bound > 1:
+                self.contract = True
+            
+            # prepare aabb with a 6D tensor (xmin, ymin, zmin, xmax, ymax, zmax)
+            # NOTE: aabb (can be rectangular) is only used to generate points, we still rely on bound (always cubic) to calculate density grid and hashing.
+            aabb_train = torch.FloatTensor(
+                [
+                    -self.real_bound,
+                    -self.real_bound,
+                    -self.real_bound,
+                    self.real_bound,
+                    self.real_bound,
+                    self.real_bound,
+                ]
+            )
+            aabb_infer = aabb_train.clone()
+            self.register_buffer("aabb_train", aabb_train)
+            self.register_buffer("aabb_infer", aabb_infer)
+            
+            # density grid
+            self.cascade = 1 + math.ceil(math.log2(self.real_bound))
+            
+            self.grid_size = self.cfg['grid_size']
+            self.min_near = self.cfg['min_near']
+            self.density_thresh = self.cfg['density_thresh']
+
+            self.max_level = 16
+            if not self.cfg['trainable_density_grid']:
+                density_grid = torch.zeros(
+                    [self.cascade, self.grid_size**3]
+                )  # [CAS, H * H * H]
+                self.register_buffer("density_grid", density_grid)
+            else:
+                self.density_grid = nn.Parameter(
+                    torch.zeros([self.cascade, self.grid_size**3])
+                )  # [CAS, H * H * H]
+            density_bitfield = torch.zeros(
+                self.cascade * self.grid_size**3 // 8, dtype=torch.uint8
+            )  # [CAS * H * H * H // 8]
+            self.register_buffer("density_bitfield", density_bitfield)
+            self.mean_density = 0
+            self.iter_density = 0
 
         if training:
             self._init_dataset()
@@ -164,7 +228,7 @@ class NeROShapeRenderer(nn.Module):
             self.train_ids = self.train_database.get_img_ids()
             self.train_ids = np.asarray(self.train_ids)
             
-            self.train_imgs_info = build_imgs_info(self.train_database, self.train_ids, self.is_nerf)
+            self.train_imgs_info = build_imgs_info(self.train_database, self.train_ids, self.use_mask)
             self.train_imgs_info = imgs_info_to_torch(self.train_imgs_info, 'cpu')
             b, _, h, w = self.train_imgs_info['imgs'].shape
             print(f'training size {h} {w} ...')
@@ -174,7 +238,7 @@ class NeROShapeRenderer(nn.Module):
             self.test_ids = self.test_database.get_img_ids()
             self.test_ids = np.asarray(self.test_ids)
             
-            self.test_imgs_info = build_imgs_info(self.test_database, self.test_ids, self.is_nerf)
+            self.test_imgs_info = build_imgs_info(self.test_database, self.test_ids, self.use_mask)
             self.test_imgs_info = imgs_info_to_torch(self.test_imgs_info, 'cpu')
             b, _, h, w = self.test_imgs_info['imgs'].shape
             print(f'valid size {h} {w} ...')
@@ -185,14 +249,14 @@ class NeROShapeRenderer(nn.Module):
             self.train_ids, self.test_ids = get_database_split(self.train_database)
             self.train_ids = np.asarray(self.train_ids)
 
-            self.train_imgs_info = build_imgs_info(self.train_database, self.train_ids, self.is_nerf)
+            self.train_imgs_info = build_imgs_info(self.train_database, self.train_ids, self.use_mask)
             self.train_imgs_info = imgs_info_to_torch(self.train_imgs_info, 'cpu')
             b, _, h, w = self.train_imgs_info['imgs'].shape
             print(f'training size {h} {w} ...')
             self.train_num = len(self.train_ids)
 
             self.test_database = self.train_database
-            self.test_imgs_info = build_imgs_info(self.test_database, self.test_ids, self.is_nerf)
+            self.test_imgs_info = build_imgs_info(self.test_database, self.test_ids, self.use_mask)
             self.test_imgs_info = imgs_info_to_torch(self.test_imgs_info, 'cpu')
             self.test_num = len(self.test_ids)
 
@@ -201,7 +265,7 @@ class NeROShapeRenderer(nn.Module):
             del self.train_batch
 
         self.train_batch, self.train_poses, self.tbn, _, _ = self._construct_nerf_ray_batch(
-            self.train_imgs_info) if self.is_nerf else self._construct_ray_batch(self.train_imgs_info)
+            self.train_imgs_info) if self.is_blender else self._construct_ray_batch(self.train_imgs_info)
         self.train_poses = self.train_poses.float().cuda()
 
         self._shuffle_train_batch()
@@ -212,7 +276,7 @@ class NeROShapeRenderer(nn.Module):
         for k, v in self.train_batch.items():
             self.train_batch[k] = v[shuffle_idxs]
 
-    def _construct_ray_batch(self, imgs_info, device='cpu'):
+    def _construct_ray_batch(self, imgs_info, device='cpu', is_train=True):
         imn, _, h, w = imgs_info['imgs'].shape
         coords = torch.stack(torch.meshgrid(torch.arange(h), torch.arange(w)), -1)[:, :, (1, 0)]  # h,w,2
         coords = coords.to(device)
@@ -226,6 +290,8 @@ class NeROShapeRenderer(nn.Module):
         imgs = imgs_info['imgs'].permute(0, 2, 3, 1).reshape(imn, h * w, 3)  # imn,h*w,3
         idxs = torch.arange(imn, dtype=torch.int64, device=device)[:, None, None].repeat(1, h * w, 1)  # imn,h*w,1
         poses = imgs_info['poses']  # imn,3,4
+        if is_train:
+            masks = imgs_info['masks'].reshape(imn, h * w)
 
         rn = imn * h * w
         ray_batch = {
@@ -233,6 +299,8 @@ class NeROShapeRenderer(nn.Module):
             'rgbs': imgs.float().reshape(rn, 3).to(device),
             'idxs': idxs.long().reshape(rn, 1).to(device),
         }
+        if is_train:
+            ray_batch['masks'] = masks.float().reshape(rn).to(device)
         return ray_batch, poses, rn, h, w
 
     def _construct_nerf_ray_batch(self, imgs_info, device='cpu', is_train=True):
@@ -376,13 +444,9 @@ class NeROShapeRenderer(nn.Module):
         return rays_o, rays_d, near, far, human_poses[idxs]  # rn, 3, 4
 
     def _process_nerf_ray_batch(self, ray_batch, poses):
-        # dirs = ray_batch['dirs']  # rn,3
         idxs = ray_batch['idxs'][..., 0]  # rn
         rays_d = ray_batch['rays_d']
         rays_o = ray_batch['rays_o']
-        # poses = poses[idxs, :3, :]
-        # rays_d = torch.sum(dirs[..., None, :] * poses[..., :3], -1)
-        # rays_o = poses[:, :, -1].expand(rays_d.shape)
         rays_d = F.normalize(rays_d, dim=-1)
         near, far = torch.full((rays_o.shape[0], 1), 1.0), torch.full((rays_o.shape[0], 1), 3.0)
 
@@ -413,7 +477,7 @@ class NeROShapeRenderer(nn.Module):
         target_imgs_info, target_img_ids = self.test_imgs_info, self.test_ids
         imgs_info = imgs_info_slice(target_imgs_info, torch.from_numpy(np.asarray([index], np.int64)))
         gt_depth, gt_mask = self.test_database.get_depth(target_img_ids[index])  # used in evaluation
-        is_nerf = self.is_nerf
+        is_blender = self.is_blender
         if self.cfg['test_downsample_ratio']:
             imgs_info = imgs_info_downsample(imgs_info, self.cfg['downsample_ratio'])
             h, w = gt_depth.shape
@@ -422,7 +486,7 @@ class NeROShapeRenderer(nn.Module):
                 cv2.resize(gt_mask.astype(np.uint8), (dw, dh), interpolation=cv2.INTER_NEAREST)
         gt_depth, gt_mask = torch.from_numpy(gt_depth), torch.from_numpy(gt_mask.astype(np.int32))
         ray_batch, input_poses, rn, h, w = self._construct_nerf_ray_batch(imgs_info, is_train=False) \
-            if is_nerf else self._construct_ray_batch(imgs_info)
+            if is_blender else self._construct_ray_batch(imgs_info, is_train=False)
 
         input_poses = input_poses.float().cuda()
         for k, v in ray_batch.items(): ray_batch[k] = v.cuda()
@@ -441,9 +505,9 @@ class NeROShapeRenderer(nn.Module):
         for ri in range(0, rn, trn):
             cur_ray_batch = {k: v[ri:ri + trn] for k, v in ray_batch.items()}
             rays_o, rays_d, near, far, human_poses = self._process_nerf_ray_batch(cur_ray_batch, input_poses) \
-                if is_nerf else self._process_ray_batch(cur_ray_batch, input_poses)
+                if is_blender else self._process_ray_batch(cur_ray_batch, input_poses)
             cur_outputs = self.render(rays_o, rays_d, near, far, human_poses, 0, 0, is_train=False, step=step,
-                                      is_nerf=is_nerf)
+                                      use_mask=self.use_mask)
             for k in outputs_keys: outputs[k].append(cur_outputs[k].detach())
 
         for k in outputs_keys: outputs[k] = torch.cat(outputs[k], 0)
@@ -458,21 +522,61 @@ class NeROShapeRenderer(nn.Module):
         self.zero_grad()
         return outputs
 
-    def train_step(self, step):
+    def train_step(
+        self, 
+        step,
+        contract=False,
+        dt_gamma=0,
+        bg_color=None,
+        perturb=False,
+        max_steps=1024,
+    ):
+        
         rn = self.cfg['train_ray_num']
-        is_nerf = self.is_nerf
+        is_blender = self.is_blender
         # fetch to gpu
         train_ray_batch = {k: v[self.train_batch_i:self.train_batch_i + rn].cuda() for k, v in self.train_batch.items()}
         self.train_batch_i += rn
         if self.train_batch_i + rn >= self.tbn: self._shuffle_train_batch()
         train_poses = self.train_poses.cuda()
         rays_o, rays_d, near, far, human_poses = self._process_nerf_ray_batch(train_ray_batch, train_poses) \
-            if is_nerf else self._process_ray_batch(train_ray_batch, train_poses)
-
-        outputs = self.render(rays_o, rays_d, near, far, human_poses, -1, self.get_anneal_val(step), is_train=True,
-                              step=step, is_nerf=is_nerf)
+            if is_blender else self._process_ray_batch(train_ray_batch, train_poses)
+        
+        if self.cfg['raymarching']:
+            nears, fars = raymarching.near_far_from_aabb(
+                rays_o,
+                rays_d,
+                self.aabb_train,
+                self.cfg['min_near'],
+            )
+            xyzs, dirs, ts, rays = raymarching.march_rays_train(
+                rays_o,
+                rays_d,
+                self.real_bound,
+                self.contract,
+                self.density_bitfield,
+                self.cascade,
+                self.grid_size,
+                nears,
+                fars,
+                perturb,
+                dt_gamma,
+                max_steps,
+            )
+            
+            results = self(xyzs, dirs, ts, step, shading=shading)
+            rgbs = results['rgbs']
+            alphas = results['alphas']
+            
+            weights, weights_sum, depth, image = raymarching.composite_rays_train(
+                alphas, rgbs, ts, rays, T_thresh, True
+            )
+        
+        else:
+            outputs = self.render(rays_o, rays_d, near, far, human_poses, -1, self.get_anneal_val(step), is_train=True,
+                                step=step, use_mask=self.use_mask)
         outputs['loss_rgb'] = self.compute_rgb_loss(outputs['ray_rgb'], train_ray_batch['rgbs'])  # ray_loss
-        if is_nerf:  # only nerf dataset add loss_mask
+        if self.use_mask:
             outputs['loss_mask'] = F.l1_loss(train_ray_batch['masks'], outputs['acc'], reduction='mean')
         return outputs
 
@@ -623,7 +727,7 @@ class NeROShapeRenderer(nn.Module):
         return z_vals
 
     def render(self, rays_o, rays_d, near, far, human_poses, perturb_overwrite=-1, cos_anneal_ratio=0.0, is_train=True,
-               step=None, is_nerf=False):
+               step=None, use_mask=False):
         """
         :param rays_o: rn,3
         :param rays_d: rn,3
@@ -641,7 +745,7 @@ class NeROShapeRenderer(nn.Module):
             perturb = perturb_overwrite
         z_vals = self.sample_ray(rays_o, rays_d, near, far, perturb)
         ret = self.render_core(rays_o, rays_d, z_vals, human_poses, cos_anneal_ratio=cos_anneal_ratio, step=step,
-                               is_train=is_train, is_nerf=is_nerf)
+                               is_train=is_train, use_mask=use_mask)
         return ret
 
     def compute_validation_info(self, z_vals, rays_o, rays_d, weights, human_poses, step):
@@ -734,7 +838,7 @@ class NeROShapeRenderer(nn.Module):
             return torch.zeros(1)
 
     def render_core(self, rays_o, rays_d, z_vals, human_poses, cos_anneal_ratio=0.0, step=None, is_train=True,
-                    is_nerf=False):
+                    use_mask=False):
         batch_size, n_samples = z_vals.shape
 
         # section length in original space
@@ -752,7 +856,7 @@ class NeROShapeRenderer(nn.Module):
         alpha, sampled_color = torch.zeros(batch_size, n_samples), torch.zeros(batch_size, n_samples, 3)
 
         if torch.sum(outer_mask) > 0:
-            if is_nerf:
+            if use_mask:
                 alpha[outer_mask] = torch.zeros_like(alpha[outer_mask])
                 sampled_color[outer_mask] = torch.zeros_like(sampled_color[outer_mask])
             else:
@@ -778,7 +882,7 @@ class NeROShapeRenderer(nn.Module):
                           :-1]  # rn,sn
         color = (sampled_color * weights[..., None]).sum(dim=1)
         acc = torch.sum(weights, -1)
-        if is_nerf:
+        if use_mask:
             color = color + (1. - acc[..., None])
 
         outputs = {
@@ -861,7 +965,8 @@ class NeROMaterialRenderer(nn.Module):
         'test_ray_num': 1024,
 
         'database_name': 'real/bear/raw_1024',
-        'is_nerf': False,
+        'is_blender': False,
+        'use_mask': True,
         'rgb_loss': 'charbonier',
 
         'mesh': 'outputs/meshes/bear_shape-300000.ply',
@@ -878,7 +983,8 @@ class NeROMaterialRenderer(nn.Module):
         self.cfg = {**self.default_cfg, **cfg}
         super().__init__()
         self.warned_normal = False
-        self.is_nerf = self.cfg['is_nerf']
+        self.is_blender = self.cfg['is_blender']
+        self.use_mask = True if self.is_blender or self.cfg['use_mask'] else False
         self._init_geometry()
         self._init_dataset(is_train)
         self._init_shader()
@@ -894,16 +1000,16 @@ class NeROMaterialRenderer(nn.Module):
         self.train_ids = np.asarray(self.train_ids)
 
         if is_train:
-            self.train_imgs_info = build_imgs_info(self.database, self.train_ids, self.is_nerf)
+            self.train_imgs_info = build_imgs_info(self.database, self.train_ids, self.use_mask)
             self.train_imgs_info = imgs_info_to_torch(self.train_imgs_info, 'cpu')
             self.train_num = len(self.train_ids)
 
-            self.test_imgs_info = build_imgs_info(self.database, self.test_ids, self.is_nerf)
+            self.test_imgs_info = build_imgs_info(self.database, self.test_ids, self.use_mask)
             self.test_imgs_info = imgs_info_to_torch(self.test_imgs_info, 'cpu')
             self.test_num = len(self.test_ids)
 
             self.train_batch = self._construct_nerf_ray_batch(
-                self.train_imgs_info) if self.is_nerf else self._construct_ray_batch(self.train_imgs_info)
+                self.train_imgs_info) if self.is_blender else self._construct_ray_batch(self.train_imgs_info)
             self.tbn = self.train_batch['rays_o'].shape[0]
             self._shuffle_train_batch()
 
@@ -1124,7 +1230,7 @@ class NeROMaterialRenderer(nn.Module):
         test_imgs_info = imgs_info_slice(self.test_imgs_info, torch.from_numpy(np.asarray([index], np.int64)))
         _, _, h, w = test_imgs_info['imgs'].shape
         ray_batch = self._construct_nerf_ray_batch(test_imgs_info, 'cuda',
-                                                   False) if self.is_nerf else self._construct_ray_batch(test_imgs_info,
+                                                   False) if self.is_blender else self._construct_ray_batch(test_imgs_info,
                                                                                                          'cuda', False)
         trn = self.cfg['test_ray_num']
 
