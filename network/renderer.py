@@ -832,7 +832,9 @@ class NeROShapeRenderer(nn.Module):
         )
         inside_mask = torch.norm(xyzs, dim=-1) < 0.999  # left some margin
         xyzs_ = xyzs[inside_mask]
-    
+        if len(xyzs_) == 0:
+            return torch.zeros_like(rays_o[...,:1])
+        
         with torch.cuda.amp.autocast(enabled=self.fp16):
             sdfs = self.get_sdf(xyzs_)[...,0]    
         raw_normals = self.get_sdf_gradient(xyzs_)
