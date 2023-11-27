@@ -7,6 +7,7 @@ import numpy as np
 from torch.optim import Adam, SGD
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+# torch.autograd.set_detect_anomaly(True)
 
 from dataset.name2dataset import name2dataset
 from network.loss import name2loss
@@ -34,7 +35,8 @@ class Trainer:
         "save_interval": 500,
         "novel_view_interval": 10000,
         "worker_num": 8,
-        'random_seed': 6033,
+        "random_seed": 6033,
+        "fp16": False,
     }
 
     def _init_dataset(self):
@@ -54,7 +56,7 @@ class Trainer:
             print(f'{name} val set len {len(val_set)}')
 
     def _init_network(self):
-        self.network = name2renderer[self.cfg['network']](self.cfg).cuda()
+        self.network = name2renderer[self.cfg['network']](self.cfg, self.cfg['fp16']).cuda()
 
         # loss
         self.val_losses = []
@@ -89,6 +91,7 @@ class Trainer:
         self.val_evaluator = ValidationEvaluator(self.cfg)
         self.lr_manager = name2lr_manager[self.cfg['lr_type']](self.cfg['lr_cfg'])
         self.optimizer = self.lr_manager.construct_optimizer(self.optimizer, self.network)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.cfg['fp16'])
 
     def __init__(self, cfg):
         self.cfg = {**self.default_cfg, **cfg}
@@ -137,22 +140,40 @@ class Trainer:
             #     self.train_network(render_data)
 
             log_info = {}
+            # raymarching: update grid every 16 steps
+            if self.train_network.raymarching and step % self.train_network.update_extra_interval == 0:
+                loss = self.train_network.update_extra_state()
+            else:
+                loss = None
+                
             outputs = self.train_network(train_data)
-            for loss in self.train_losses:
-                loss_results = loss(outputs, train_data, step)
+            for loss_fn in self.train_losses:
+                loss_results = loss_fn(outputs, train_data, step)
                 for k, v in loss_results.items():
                     log_info[k] = v
-
-            loss = 0
+            
+            loss = 0 if loss is None else loss
             for k, v in log_info.items():
                 if k.startswith('loss'):
                     loss = loss + torch.mean(v)
 
-            loss.backward()
-            self.optimizer.step()
+            # loss.backward()
+            # self.optimizer.step()
+            
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
             if ((step + 1) % self.cfg['train_log_step']) == 0:
                 self._log_data(log_info, step + 1, 'train')
-
+            
+            # raymarching adaptive_num_rays
+            if self.train_network.raymarching and self.train_network.adaptive_num_rays:
+                self.train_network.num_rays = int(
+                    round((self.train_network.num_points / outputs["num_points"]) * self.train_network.num_rays)
+                )
+                
+            # val
             if (step + 1) % self.cfg['val_interval'] == 0 or (step + 1) == self.cfg['total_step']:
                 torch.cuda.empty_cache()
                 val_results = {}
@@ -222,6 +243,7 @@ class Trainer:
             start_step = checkpoint['step']
             self.network.load_state_dict(checkpoint['network_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
             print(f'==> resuming from step {start_step} best para {best_para}')
 
         return best_para, start_step
@@ -233,6 +255,7 @@ class Trainer:
             'best_para': best_para,
             'network_state_dict': self.network.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
         }, save_fn)
 
     def _init_logger(self):

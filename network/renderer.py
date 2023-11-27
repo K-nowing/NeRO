@@ -10,12 +10,14 @@ import torch.nn.functional as F
 from dataset.database import parse_database_name, get_database_split, BaseDatabase, NeRFSyntheticDatabase
 from network.field import SDFNetwork, SingleVarianceNetwork, NeRFNetwork, AppShadingNetwork, get_intersection, \
     extract_geometry, sample_pdf, MCShadingNetwork
-from utils.base_utils import color_map_forward, downsample_gaussian_blur
+from utils.base_utils import color_map_forward, downsample_gaussian_blur, custom_meshgrid
 from utils.raw_utils import linear_to_srgb
 
 from tqdm import trange
 
 import raymarching
+
+from nerf2mesh_encoding import get_encoder, MLP
 
 
 def build_imgs_info(database: BaseDatabase, img_ids, use_mask=False):
@@ -99,23 +101,29 @@ class NeROShapeRenderer(nn.Module):
         'sdf_freq': 6,
         'sdf_d_out': 257,
         'geometry_init': True,
+        'hash_encoding': False,
 
         # shader network
         'shader_config': {},
 
         # sampling strategy
-        'raymarching': False,
+        'raymarching': True,
+        'anneal_end': 50000,
+        
         ## raymarching
-        'num_rays': 2048,
-        'num_points': 2**18,
+        'num_rays': 4096 // 8,
+        'max_steps': 1024 // 8, 
+        'num_points': 2**18 // 8,
         'adaptive_num_rays': True,
         'grid_size': 128,
-        'density_thresh': 0.001,  # for sdf default
-        'trainable_density_grid': False,
         'bound': 1.0,
         'scale': 1.0,
         'offset': [0.0, 0.0, 0.0],
         'min_near': 0.05,
+        'density_thresh': 0.001,  # for sdf default
+        'trainable_density_grid': False,
+        'lambda_density': 0,
+        'update_extra_interval': 16,
         ## non raymarching
         'n_samples': 64,
         'n_bg_samples': 32,
@@ -123,7 +131,6 @@ class NeROShapeRenderer(nn.Module):
         'n_importance': 64,
         'up_sample_steps': 4,  # 1 for simple coarse-to-fine sampling
         'perturb': 1.0,
-        'anneal_end': 50000,
         'train_ray_num': 512,
         'test_ray_num': 512,
         'clip_sample_variance': True,
@@ -148,18 +155,31 @@ class NeROShapeRenderer(nn.Module):
         "fixed_camera": False,
     }
 
-    def __init__(self, cfg, training=True):
+    def __init__(self, cfg, fp16=False, training=True):
         super().__init__()
         self.cfg = {**self.default_cfg, **cfg}
         self.is_blender = self.cfg['is_blender']
         self.use_mask = True if self.is_blender or self.cfg['use_mask'] else False
+        self.hash_encoding = self.cfg['hash_encoding']
+        self.fp16 = fp16
 
-        self.sdf_network = SDFNetwork(d_out=self.cfg['sdf_d_out'], d_in=3, d_hidden=256,
-                                      n_layers=self.cfg['sdf_n_layers'],
-                                      skip_in=[self.cfg['sdf_n_layers'] // 2], multires=self.cfg['sdf_freq'],
-                                      bias=self.cfg['sdf_bias'], scale=1.0,
-                                      geometric_init=self.cfg['geometry_init'],
-                                      weight_norm=True, sdf_activation=self.cfg['sdf_activation'])
+        if self.hash_encoding:
+            self.encoder, in_dim_density = get_encoder(
+                "hashgrid_tcnn" if True else "hashgrid",
+                level_dim=1,
+                desired_resolution=2048 * 1,
+                interpolation="smoothstep",
+            )
+            self.sdf_net = MLP(
+                in_dim_density + 3, 1, 64, 3, geom_init=True, weight_norm=True
+            )
+        else:
+            self.sdf_network = SDFNetwork(d_out=self.cfg['sdf_d_out'], d_in=3, d_hidden=256,
+                                        n_layers=self.cfg['sdf_n_layers'],
+                                        skip_in=[self.cfg['sdf_n_layers'] // 2], multires=self.cfg['sdf_freq'],
+                                        bias=self.cfg['sdf_bias'], scale=1.0,
+                                        geometric_init=self.cfg['geometry_init'],
+                                        weight_norm=True, sdf_activation=self.cfg['sdf_activation'])
 
         self.deviation_network = SingleVarianceNetwork(init_val=self.cfg['inv_s_init'], activation=self.cfg['std_act'])
 
@@ -169,14 +189,26 @@ class NeROShapeRenderer(nn.Module):
                                         skips=[4], use_viewdirs=True)
             nn.init.constant_(self.outer_nerf.rgb_linear.bias, np.log(0.5))
 
-        self.color_network = AppShadingNetwork(self.cfg['shader_config'])
-        self.sdf_inter_fun = lambda x: self.sdf_network.sdf(x)
+        assert self.cfg['bound'] == 1
+        self.color_network = AppShadingNetwork(self.cfg['shader_config'], 1, self.hash_encoding, self.fp16)
         
-        if self.cfg['raymarching']:
+        self.raymarching = self.cfg['raymarching']
+        self.update_extra_interval = self.cfg['update_extra_interval']
+        
+        if self.raymarching:
+            self.num_rays = self.cfg['num_rays']
+            self.max_steps = self.cfg['max_steps']
+            self.num_points = self.cfg['num_points']
+            self.adaptive_num_rays = self.cfg['adaptive_num_rays']
+            
             self.real_bound = self.cfg['bound']
             # contract background
-            if self.real_bound > 1:
-                self.contract = True
+            self.contract = True if self.real_bound > 1 else False
+            # bound for grid querying
+            if self.contract:
+                self.bound = 2
+            else:
+                self.bound = self.cfg['bound']
             
             # prepare aabb with a 6D tensor (xmin, ymin, zmin, xmax, ymax, zmax)
             # NOTE: aabb (can be rectangular) is only used to generate points, we still rely on bound (always cubic) to calculate density grid and hashing.
@@ -220,6 +252,31 @@ class NeROShapeRenderer(nn.Module):
 
         if training:
             self._init_dataset()
+
+    def get_sdf(self, x, return_feature=False):
+        if self.hash_encoding:
+            shape = x.shape[:-1]
+            x = x.view(-1,3)
+            h = self.encoder(x, bound=self.bound, max_level=self.max_level)
+            h = torch.cat([x, h], dim=-1)
+            sdf = self.sdf_net(h)
+            sdf = sdf.view(shape + (-1,)).float()
+            feature = None
+        else:
+            h = self.sdf_network(x)
+            sdf = h[..., :1]
+            feature = h[..., 1:]
+        if return_feature:
+            return sdf, feature
+        else:
+            return sdf
+    
+    def get_sdf_gradient(self, x):
+        with torch.enable_grad():
+            x.requires_grad_(True)
+            sdf = self.get_sdf(x)[...,0]
+            normal = torch.autograd.grad(torch.sum(sdf), x, create_graph=True)[0]  # [N, 3]
+        return normal
 
     def _init_dataset(self):
         # train/test split
@@ -506,8 +563,12 @@ class NeROShapeRenderer(nn.Module):
             cur_ray_batch = {k: v[ri:ri + trn] for k, v in ray_batch.items()}
             rays_o, rays_d, near, far, human_poses = self._process_nerf_ray_batch(cur_ray_batch, input_poses) \
                 if is_blender else self._process_ray_batch(cur_ray_batch, input_poses)
-            cur_outputs = self.render(rays_o, rays_d, near, far, human_poses, 0, 0, is_train=False, step=step,
-                                      use_mask=self.use_mask)
+                
+            if self.raymarching:
+                cur_outputs = self.render_raymarching(rays_o, rays_d, human_poses, step=step, is_train=False)
+            else:
+                cur_outputs = self.render(rays_o, rays_d, near, far, human_poses, 0, 0, is_train=False, step=step,
+                                        use_mask=self.use_mask)
             for k in outputs_keys: outputs[k].append(cur_outputs[k].detach())
 
         for k in outputs_keys: outputs[k] = torch.cat(outputs[k], 0)
@@ -525,14 +586,12 @@ class NeROShapeRenderer(nn.Module):
     def train_step(
         self, 
         step,
-        contract=False,
-        dt_gamma=0,
-        bg_color=None,
-        perturb=False,
-        max_steps=1024,
     ):
         
-        rn = self.cfg['train_ray_num']
+        if raymarching:
+            rn = self.num_rays
+        else:
+            rn = self.cfg['train_ray_num']
         is_blender = self.is_blender
         # fetch to gpu
         train_ray_batch = {k: v[self.train_batch_i:self.train_batch_i + rn].cuda() for k, v in self.train_batch.items()}
@@ -542,37 +601,11 @@ class NeROShapeRenderer(nn.Module):
         rays_o, rays_d, near, far, human_poses = self._process_nerf_ray_batch(train_ray_batch, train_poses) \
             if is_blender else self._process_ray_batch(train_ray_batch, train_poses)
         
-        if self.cfg['raymarching']:
-            nears, fars = raymarching.near_far_from_aabb(
-                rays_o,
-                rays_d,
-                self.aabb_train,
-                self.cfg['min_near'],
-            )
-            xyzs, dirs, ts, rays = raymarching.march_rays_train(
-                rays_o,
-                rays_d,
-                self.real_bound,
-                self.contract,
-                self.density_bitfield,
-                self.cascade,
-                self.grid_size,
-                nears,
-                fars,
-                perturb,
-                dt_gamma,
-                max_steps,
-            )
-            
-            results = self(xyzs, dirs, ts, step, shading=shading)
-            rgbs = results['rgbs']
-            alphas = results['alphas']
-            
-            weights, weights_sum, depth, image = raymarching.composite_rays_train(
-                alphas, rgbs, ts, rays, T_thresh, True
-            )
-        
+        if self.raymarching:
+            outputs = self.render_raymarching(rays_o, rays_d, human_poses, step=step, is_train=True)
         else:
+            self.max_level = 4 + int(12 * min(1, self.get_anneal_val(step)))
+            self.color_network.max_level = self.max_level
             outputs = self.render(rays_o, rays_d, near, far, human_poses, -1, self.get_anneal_val(step), is_train=True,
                                 step=step, use_mask=self.use_mask)
         outputs['loss_rgb'] = self.compute_rgb_loss(outputs['ray_rgb'], train_ray_batch['rgbs'])  # ray_loss
@@ -676,7 +709,7 @@ class NeROShapeRenderer(nn.Module):
         z_vals, index = torch.sort(z_vals, dim=-1)
 
         if not last:
-            new_sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, n_importance)
+            new_sdf = self.get_sdf(pts.reshape(-1, 3)).reshape(batch_size, n_importance)
             sdf = torch.cat([sdf, new_sdf], dim=-1)
             xx = torch.arange(batch_size)[:, None].expand(batch_size, n_samples + n_importance).reshape(-1)
             index = index.reshape(-1)
@@ -711,7 +744,7 @@ class NeROShapeRenderer(nn.Module):
         # Up sample
         with torch.no_grad():
             pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
-            sdf = self.sdf_network.sdf(pts).reshape(batch_size, n_samples)
+            sdf = self.get_sdf(pts).reshape(batch_size, n_samples)
 
             for i in range(up_sample_steps):
                 rn, sn = z_vals.shape
@@ -748,34 +781,91 @@ class NeROShapeRenderer(nn.Module):
                                is_train=is_train, use_mask=use_mask)
         return ret
 
-    def compute_validation_info(self, z_vals, rays_o, rays_d, weights, human_poses, step):
-        depth = torch.sum(weights * z_vals, -1, keepdim=True)  # rn,
+    def compute_validation_info(self, z_vals, rays_o, rays_d, weights, human_poses, step, depth=None):
+        if depth is None:
+            depth = torch.sum(weights * z_vals, -1, keepdim=True)  # rn,
         points = depth * rays_d + rays_o  # rn,3
-        gradients = self.sdf_network.gradient(points)  # rn,3
+        gradients = self.get_sdf_gradient(points)  # rn,3
         inner_mask = torch.norm(points, dim=-1, keepdim=True) <= 1.0
         outputs = {
             'depth': depth,  # rn,1
             'normal': ((F.normalize(gradients, dim=-1) + 1.0) * 0.5) * inner_mask,  # rn,3
         }
 
-        feature_vector = self.sdf_network(points)[..., 1:]  # rn,f
-        _, occ_info, inter_results = self.color_network(points, gradients, -F.normalize(rays_d, dim=-1), feature_vector,
+        if self.hash_encoding:
+            _, occ_info, inter_results = self.color_network(points, gradients, -F.normalize(rays_d, dim=-1),
                                                         human_poses, inter_results=True, step=step)
-        _, occ_prob, _ = get_intersection(self.sdf_inter_fun, self.deviation_network, points, occ_info['reflective'],
-                                          sn0=128, sn1=9)  # pn,sn-1
-        occ_prob_gt = torch.sum(occ_prob, dim=-1, keepdim=True)
+        else:
+            feature_vector = self.sdf_network(points)[..., 1:]  # rn,f
+            _, occ_info, inter_results = self.color_network(points, gradients, -F.normalize(rays_d, dim=-1), 
+                                                        human_poses, feature_vector, inter_results=True, step=step)
+        
+        if self.raymarching:
+            occ_prob_gt = self.get_gt_occ_by_raymarching(points, occ_info['reflective'])
+        else:
+            _, occ_prob, _ = get_intersection(self.get_sdf, self.deviation_network, points, occ_info['reflective'],
+                                              sn0=128, sn1=9)  # pn,sn-1
+            occ_prob_gt = torch.sum(occ_prob, dim=-1, keepdim=True)
         outputs['occ_prob_gt'] = occ_prob_gt
         for k, v in inter_results.items(): inter_results[k] = v * inner_mask
         outputs.update(inter_results)
         return outputs
+    
+    @torch.no_grad()
+    def get_gt_occ_by_raymarching(self, rays_o, rays_d, dt_gamma=0, max_steps=16, T_thresh=1e-4):
+        nears, fars = raymarching.near_far_from_aabb(
+            rays_o, rays_d, self.aabb_train if self.training else self.aabb_infer, 0
+        )
+        xyzs, dirs, ts, rays = raymarching.march_rays_train(
+            rays_o,
+            rays_d,
+            self.real_bound,
+            self.contract,
+            self.density_bitfield,
+            self.cascade,
+            self.grid_size,
+            nears,
+            fars,
+            False,
+            dt_gamma,
+            max_steps,
+        )
+        inside_mask = torch.norm(xyzs, dim=-1) < 0.999  # left some margin
+        xyzs_ = xyzs[inside_mask]
+    
+        with torch.cuda.amp.autocast(enabled=self.fp16):
+            sdfs = self.get_sdf(xyzs_)[...,0]    
+        raw_normals = self.get_sdf_gradient(xyzs_)
+        normals = F.normalize(raw_normals, dim=-1)
+        dirs = F.normalize(dirs[inside_mask], dim=-1)
+        true_cos = (dirs * normals).sum(-1)
+        inv_s = self.deviation_network(sdfs).clamp(1e-6, 1e6)
+        
+        surface_mask = (true_cos < 0)
+        true_cos = true_cos.clamp(max=0)
+        
+        estimated_prev_sdf = sdfs - true_cos * ts[inside_mask][:, 1] * 0.5
+        estimated_next_sdf = sdfs + true_cos * ts[inside_mask][:, 1] * 0.5
+        prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+        next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+        p = prev_cdf - next_cdf
+        c = prev_cdf
+        alphas_ = ((p + 1e-5) / (c + 1e-5)).view(-1).clamp(0, 1) * surface_mask.float()
+        alphas = torch.zeros_like(xyzs[...,0])
+        alphas[inside_mask] = alphas_
+
+        empty_rgbs = torch.zeros((*alphas.shape, 3), device=alphas.device)
+        weights, weights_sum, depth, image = raymarching.composite_rays_train(
+            alphas, empty_rgbs, ts, rays, T_thresh, True
+        )
+        return weights_sum[..., None]
 
     def compute_sdf_alpha(self, points, dists, dirs, cos_anneal_ratio, step):
         # points [...,3] dists [...] dirs[...,3]
-        sdf_nn_output = self.sdf_network(points)
-        sdf = sdf_nn_output[..., 0]
-        feature_vector = sdf_nn_output[..., 1:]
+        sdf, feature_vector = self.get_sdf(points, return_feature=True)  # [...,1], [...,f_n] or None
+        sdf = sdf[..., 0]
 
-        gradients = self.sdf_network.gradient(points)  # ...,3
+        gradients = self.get_sdf_gradient(points)  # ...,3
         inv_s = self.deviation_network(points).clip(1e-6, 1e6)  # ...,1
         inv_s = inv_s[..., 0]
 
@@ -829,10 +919,13 @@ class NeROShapeRenderer(nn.Module):
             mask = mask_new
 
         if torch.sum(mask) > 0:
-            inter_dist, inter_prob, inter_sdf = get_intersection(self.sdf_inter_fun, self.deviation_network,
+            if self.raymarching:
+                occ_prob_gt = self.get_gt_occ_by_raymarching(points[mask], reflective[mask])
+            else:
+                _, inter_prob, _ = get_intersection(self.get_sdf, self.deviation_network, points[mask], reflective[mask],
                                                                  points[mask], reflective[mask], sn0=64,
                                                                  sn1=16)  # pn,sn-1
-            occ_prob_gt = torch.sum(inter_prob, -1, keepdim=True)
+                occ_prob_gt = torch.sum(inter_prob, -1, keepdim=True)
             return F.l1_loss(occ_prob[mask], occ_prob_gt)
         else:
             return torch.zeros(1)
@@ -870,8 +963,10 @@ class NeROShapeRenderer(nn.Module):
                                                                                               dists[inner_mask],
                                                                                               dirs[inner_mask],
                                                                                               cos_anneal_ratio, step)
+            if self.hash_encoding:
+                feature_vector = None
             sampled_color[inner_mask], occ_info = self.color_network(points[inner_mask], gradients, -dirs[inner_mask],
-                                                                     feature_vector, human_poses_pt[inner_mask],
+                                                                     human_poses_pt[inner_mask], feature_vector, 
                                                                      step=step)
             # Eikonal loss
             gradient_error = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
@@ -899,7 +994,6 @@ class NeROShapeRenderer(nn.Module):
         if step < 1000:
             mask = torch.norm(points, dim=-1) < 1.2
             outputs['sdf_pts'] = points[mask]
-            outputs['sdf_vals'] = self.sdf_network.sdf(points[mask])[..., 0]
 
         if self.cfg['apply_occ_loss']:
             # occlusion loss
@@ -913,6 +1007,90 @@ class NeROShapeRenderer(nn.Module):
             outputs.update(self.compute_validation_info(z_vals, rays_o, rays_d, weights, human_poses, step))
 
         return outputs
+    
+    
+    def render_raymarching(self, rays_o, rays_d, human_poses, perturb=False, dt_gamma=0, T_thresh=1e-4, step=None, is_train=True):
+        nears, fars = raymarching.near_far_from_aabb(
+            rays_o,
+            rays_d,
+            self.aabb_train if is_train else self.aabb_infer,
+            self.cfg['min_near'],
+        )
+        points, dirs, ts, rays = raymarching.march_rays_train(
+            rays_o,
+            rays_d,
+            self.real_bound,
+            self.contract,
+            self.density_bitfield,
+            self.cascade,
+            self.grid_size,
+            nears,
+            fars,
+            perturb,
+            dt_gamma,
+            self.max_steps,
+        )
+        
+        sampled_color, alpha, outputs = self.forward_points(points, dirs, ts, human_poses, self.get_anneal_val(step), step=step, is_train=True)
+        
+        weights, acc, depth, color = raymarching.composite_rays_train(
+            alpha, sampled_color, ts, rays, T_thresh, True
+        )
+            
+        if self.use_mask:
+            color = color + (1. - acc[..., None])
+
+        outputs['ray_rgb'] = color
+        outputs['acc'] = acc
+        outputs['num_points'] = len(points)
+        if not is_train:
+            outputs['depth'] = depth  
+            outputs.update(self.compute_validation_info(None, rays_o, rays_d, weights, human_poses, step, depth=depth.unsqueeze(-1)))
+        return outputs
+    
+    def forward_points(self, points, dirs, ts, human_poses, cos_anneal_ratio=0.0, step=None, is_train=True):
+        outputs = {}
+        points_num = len(points)
+        dists = ts[:, 1]
+        inner_mask = (torch.abs(points) <= 1.0).any(dim=-1)
+        outer_mask = ~inner_mask
+
+        # human_poses_pt = human_poses.unsqueeze(-3).expand(batch_size, n_samples, 3, 4)
+        human_poses_pt = None  # not implemented yet
+        
+        dirs = F.normalize(dirs, dim=-1)
+        alpha, sampled_color = torch.zeros(points_num), torch.zeros(points_num, 3)
+
+        if torch.sum(outer_mask) > 0:
+            raise
+        if torch.sum(inner_mask) > 0:
+            alpha[inner_mask], gradients, feature_vector, inv_s, sdf = self.compute_sdf_alpha(points[inner_mask],
+                                                                                              dists[inner_mask],
+                                                                                              dirs[inner_mask],
+                                                                                              cos_anneal_ratio, step)
+            sampled_color[inner_mask], occ_info = self.color_network(points[inner_mask], gradients, -dirs[inner_mask],
+                                                                     human_poses_pt, feature_vector, 
+                                                                     step=step)
+            # Eikonal loss
+            outputs['gradient_error'] = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
+            outputs['std'] = torch.mean(1 / inv_s)
+        else:
+            outputs['gradient_error'] = torch.zeros(1)
+            outputs['std'] = torch.zeros(1)
+
+        if step < 1000:
+            mask = torch.norm(points, dim=-1) < 1.2
+            outputs['sdf_pts'] = points[mask]
+        
+        if self.cfg['apply_occ_loss']:
+            # occlusion loss
+            if torch.sum(inner_mask) > 0:
+                outputs['loss_occ'] = self.compute_occ_loss(occ_info, points[inner_mask], sdf, gradients,
+                                                            dirs[inner_mask], step)
+            else:
+                outputs['loss_occ'] = torch.zeros(1)
+            
+        return sampled_color, alpha, outputs
 
     def forward(self, data):
         torch.set_default_tensor_type('torch.cuda.FloatTensor')
@@ -931,7 +1109,7 @@ class NeROShapeRenderer(nn.Module):
             if index == 0 and self.cfg['val_geometry']:
                 bbox_min = -torch.ones(3)
                 bbox_max = torch.ones(3)
-                vertices, triangles = extract_geometry(bbox_min, bbox_max, 128, 0, lambda x: self.sdf_network.sdf(x))
+                vertices, triangles = extract_geometry(bbox_min, bbox_max, 128, 0, lambda x: self.get_sdf(x))
                 outputs['vertices'] = vertices
                 outputs['triangles'] = triangles
 
@@ -948,8 +1126,11 @@ class NeROShapeRenderer(nn.Module):
         metallic, roughness, albedo = [], [], []
         batch_size = 8192
         for vi in range(0, xyz.shape[0], batch_size):
-            feature_vectors = self.sdf_network(xyz[vi:vi + batch_size])[:, 1:]
-            m, r, a = self.color_network.predict_materials(xyz[vi:vi + batch_size], feature_vectors)
+            if self.hash_encoding:
+                m, r, a = self.color_network.predict_materials(xyz[vi:vi + batch_size])
+            else:
+                _, feature_vectors = self.get_sdf(xyz[vi:vi + batch_size], return_feature=True)
+                m, r, a = self.color_network.predict_materials(xyz[vi:vi + batch_size], feature_vectors)
             metallic.append(m.cpu().numpy())
             roughness.append(r.cpu().numpy())
             albedo.append(a.cpu().numpy())
@@ -957,6 +1138,97 @@ class NeROShapeRenderer(nn.Module):
         return {'metallic': np.concatenate(metallic, 0),
                 'roughness': np.concatenate(roughness, 0),
                 'albedo': np.concatenate(albedo, 0)}
+        
+    def update_extra_state(self, decay=0.95, S=128):
+        # call before each epoch to update extra states.
+        ### update density grid
+
+        with torch.no_grad():
+            tmp_grid = -torch.ones_like(self.density_grid)
+
+            X = torch.arange(
+                self.grid_size, dtype=torch.int32, device=self.density_bitfield.device
+            ).split(S)
+            Y = torch.arange(
+                self.grid_size, dtype=torch.int32, device=self.density_bitfield.device
+            ).split(S)
+            Z = torch.arange(
+                self.grid_size, dtype=torch.int32, device=self.density_bitfield.device
+            ).split(S)
+
+            for xs in X:
+                for ys in Y:
+                    for zs in Z:
+                        # construct points
+                        xx, yy, zz = custom_meshgrid(xs, ys, zs)
+                        coords = torch.cat(
+                            [xx.reshape(-1, 1), yy.reshape(-1, 1), zz.reshape(-1, 1)],
+                            dim=-1,
+                        )  # [N, 3], in [0, 128)
+                        indices = raymarching.morton3D(coords).long()  # [N]
+                        xyzs = (
+                            2 * coords.float() / (self.grid_size - 1) - 1
+                        )  # [N, 3] in [-1, 1]
+
+                        # cascading
+                        for cas in range(self.cascade):
+                            bound = min(2**cas, self.bound)
+                            half_grid_size = bound / self.grid_size
+                            # scale to current cascade's resolution
+                            cas_xyzs = xyzs * (bound - half_grid_size)
+                            # add noise in [-hgs, hgs]
+                            cas_xyzs += (
+                                torch.rand_like(cas_xyzs) * 2 - 1
+                            ) * half_grid_size
+                            # query density
+                            with torch.cuda.amp.autocast(enabled=self.fp16):
+                                sdfs = self.get_sdf(cas_xyzs).reshape(-1).detach()
+                                inv_s = self.deviation_network(sdfs).clamp(1e-6, 1e6)
+                                sdfs = torch.sigmoid(-sdfs * inv_s) * inv_s
+                            # assign
+                            tmp_grid[cas, indices] = sdfs
+
+            # ema update
+            valid_mask = (self.density_grid >= 0) & (tmp_grid >= 0)
+
+        if not self.cfg['trainable_density_grid']:
+            self.density_grid[valid_mask] = torch.maximum(
+                self.density_grid[valid_mask] * decay, tmp_grid[valid_mask]
+            )
+        else:
+            # update grid via a loss term.
+            loss = F.mse_loss(self.density_grid[valid_mask], tmp_grid[valid_mask])
+
+            # cascaded reg
+            loss_density = 0
+            if self.cfg['lambda_density'] > 0:
+                for cas in range(1, self.cascade):
+                    loss_density = (
+                        loss_density
+                        + (2 ** (cas - 1))
+                        * self.cfg['lambda_density']
+                        * self.density_grid[cas][valid_mask[cas]].mean()
+                    )
+
+        self.mean_density = torch.mean(
+            self.density_grid.clamp(min=0)
+        ).item()  # -1 regions are viewed as 0 density.
+        # self.mean_density = torch.mean(self.density_grid[self.density_grid > 0]).item() # do not count -1 regions
+        self.iter_density += 1
+
+        # convert to bitfield
+        density_thresh = min(self.mean_density, self.density_thresh)
+        # density_thresh = 0 if self.iter_density < 64 else self.density_thresh
+        self.density_bitfield = raymarching.packbits(
+            self.density_grid.detach(), density_thresh, self.density_bitfield
+        )
+
+        # print(f'[density grid] min={self.density_grid.min().item():.4f}, max={self.density_grid.max().item():.4f}, mean={self.mean_density:.4f}, occ_rate={(self.density_grid > density_thresh).sum() / (128**3 * self.cascade):.3f}')
+
+        if not self.cfg['trainable_density_grid']:
+            return None
+        else:
+            return loss + loss_density
 
 
 class NeROMaterialRenderer(nn.Module):

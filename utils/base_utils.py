@@ -8,6 +8,7 @@ import torch
 import numpy as np
 import pickle
 
+from packaging import version as pver
 import yaml
 from numpy import ndarray
 from plyfile import PlyData
@@ -900,3 +901,11 @@ def az_el_to_points(azimuths, elevations):
     x = np.cos(azimuths) * np.cos(elevations)
     y = np.sin(azimuths) * np.cos(elevations)
     return np.stack([x, y, z], -1)  #
+
+
+def custom_meshgrid(*args):
+    # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
+    if pver.parse(torch.__version__) < pver.parse("1.10"):
+        return torch.meshgrid(*args)
+    else:
+        return torch.meshgrid(*args, indexing="ij")

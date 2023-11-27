@@ -668,7 +668,7 @@ __global__ void kernel_composite_rays_train_backward(
         grad_rgbs[2] = grad_image[2] * weight;
 
         // write grad_sigmas
-        const float grad_scale = alpha_mode ? (1.0f / (1.0f - alpha)) : (float)ts[1];
+        const float grad_scale = alpha_mode ? (1.0f / (1.0f - alpha + 1e-10f)) : (float)ts[1];
         grad_sigmas[0] = grad_scale * (
             grad_image[0] * (T * rgbs[0] - (r_final - r)) + 
             grad_image[1] * (T * rgbs[1] - (g_final - g)) + 
