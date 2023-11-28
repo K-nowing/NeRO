@@ -11,6 +11,9 @@ from utils.ref_utils import generate_ide_fn
 
 from nerf2mesh_encoding import get_encoder, MLP
 
+def safe_normalize(x, dim=-1, eps=1e-20):
+    return x / torch.sqrt(torch.clamp(torch.sum(x * x, dim, keepdim=True), min=eps))
+
 # Positional encoding embedding. Code was taken from https://github.com/bmild/nerf.
 class Embedder:
     def __init__(self, **kwargs):
@@ -614,7 +617,7 @@ class AppShadingNetwork(nn.Module):
             
             if self.cfg['sphere_direction']:
                 sph_points = offset_points_to_sphere(points)
-                sph_points = F.normalize(sph_points + reflective * get_sphere_intersection(sph_points, reflective), dim=-1)
+                sph_points = safe_normalize(sph_points + reflective * get_sphere_intersection(sph_points, reflective), dim=-1)
                 sph_points = self.sph_enc(sph_points, roughness)
                 direct_light = self.outer_light(torch.cat([ref_roughness, sph_points], -1))
             else:
@@ -626,7 +629,8 @@ class AppShadingNetwork(nn.Module):
             
         if self.cfg['direct_light'] and self.cfg['indirect_light']:
             ref_ = self.dir_enc(reflective)
-            occ_prob = self.inner_weight(torch.cat([pts.detach(), ref_.detach()], -1))  # this is occlusion prob
+            with torch.cuda.amp.autocast(enabled=False):
+                occ_prob = self.inner_weight(torch.cat([pts.detach(), ref_.detach()], -1))  # this is occlusion prob
             occ_prob = occ_prob * 0.5 + 0.5
             occ_prob_ = torch.clamp(occ_prob, min=0, max=1)
 
@@ -649,7 +653,7 @@ class AppShadingNetwork(nn.Module):
         ref = self.sph_enc(normals, roughness)  # von Mises-Fisher distribution
         if self.cfg['sphere_direction']:
             sph_points = offset_points_to_sphere(points)
-            sph_points = F.normalize(sph_points + normals * get_sphere_intersection(sph_points, normals), dim=-1)
+            sph_points = safe_normalize(sph_points + normals * get_sphere_intersection(sph_points, normals), dim=-1)
             sph_points = self.sph_enc(sph_points, roughness)
             light = self.outer_light(torch.cat([ref, sph_points], -1))
         else:
@@ -657,27 +661,26 @@ class AppShadingNetwork(nn.Module):
         return light
 
     def forward(self, points, normals, view_dirs, human_poses, feature_vectors=None, inter_results=False, step=None):
-        normals = F.normalize(normals, dim=-1)
-        view_dirs = F.normalize(view_dirs, dim=-1)
+        normals = safe_normalize(normals, dim=-1)
+        view_dirs = safe_normalize(view_dirs, dim=-1)
         reflective = torch.sum(view_dirs * normals, -1, keepdim=True) * normals * 2 - view_dirs
         NoV = torch.sum(normals * view_dirs, -1, keepdim=True)
 
-        with torch.cuda.amp.autocast(enabled=self.fp16):
-            if self.hash_encoding:
-                albedo, metallic, roughness = self.predict_materials(points)
-            else:
-                albedo, metallic, roughness = self.predict_materials(points, feature_vectors)
-            # diffuse light
-            diffuse_light = self.predict_diffuse_lights(points, normals)
+        if self.hash_encoding:
+            albedo, metallic, roughness = self.predict_materials(points)
+        else:
+            albedo, metallic, roughness = self.predict_materials(points, feature_vectors)
+        # diffuse light
+        diffuse_light = self.predict_diffuse_lights(points, normals)
         diffuse_albedo = (1 - metallic) * albedo
         diffuse_color = diffuse_albedo * diffuse_light
 
         # specular light
         specular_albedo = 0.04 * (1 - metallic) + metallic * albedo
-        with torch.cuda.amp.autocast(enabled=self.fp16):
-            specular_light, occ_prob, indirect_light, human_light = self.predict_specular_lights(points,
-                                                                                                reflective, roughness,
-                                                                                                human_poses, step)
+        
+        specular_light, occ_prob, indirect_light, human_light = self.predict_specular_lights(points,
+                                                                                            reflective, roughness,
+                                                                                            human_poses, step)
 
         fg_uv = torch.cat([torch.clamp(NoV, min=0.0, max=1.0), torch.clamp(roughness, min=0.0, max=1.0)], -1)
         pn, bn = points.shape[0], 1
@@ -849,7 +852,7 @@ class MCShadingNetwork(nn.Module):
         otho = torch.zeros_like(directions)
         otho[mask0] = otho0[mask0]
         otho[mask1] = otho1[mask1]
-        otho = F.normalize(otho, dim=-1)
+        otho = safe_normalize(otho, dim=-1)
         return otho
 
     def sample_diffuse_directions(self, normals, is_train):
@@ -898,8 +901,8 @@ class MCShadingNetwork(nn.Module):
 
     def get_inner_lights(self, points, view_dirs, normals):
         pos_enc = self.pos_enc(points)
-        normals = F.normalize(normals, dim=-1)
-        view_dirs = F.normalize(view_dirs, dim=-1)
+        normals = safe_normalize(normals, dim=-1)
+        view_dirs = safe_normalize(view_dirs, dim=-1)
         reflections = torch.sum(view_dirs * normals, -1, keepdim=True) * normals * 2 - view_dirs
         dir_enc = self.sph_enc(reflections, 0)
         return self.inner_light(torch.cat([pos_enc, dir_enc], -1))
@@ -995,7 +998,7 @@ class MCShadingNetwork(nn.Module):
 
     def fresnel_schlick_directions(self, F0, view_dirs, directions):
         H = (view_dirs + directions)  # [pn,sn0,3]
-        H = F.normalize(H, dim=-1)
+        H = safe_normalize(H, dim=-1)
         HoV = torch.clamp(torch.sum(H * view_dirs, dim=-1, keepdim=True), min=0.0, max=1.0)  # [pn,sn0,1]
         fresnel = self.fresnel_schlick(F0, HoV)  # [pn,sn0,1]
         return fresnel, H, HoV
@@ -1064,7 +1067,7 @@ class MCShadingNetwork(nn.Module):
 
         # specualr sample prob
         H_s = (view_dirs.unsqueeze(1) + specular_directions)  # [pn,sn0,3] half vector
-        H_s = F.normalize(H_s, dim=-1)
+        H_s = safe_normalize(H_s, dim=-1)
         NoH_s = saturate_dot(normals.unsqueeze(1), H_s)
         VoH_s = saturate_dot(view_dirs.unsqueeze(1), H_s)
         specular_probability = self.distribution_ggx(NoH_s, roughness.unsqueeze(1)) * NoH_s / (4 * VoH_s + 1e-5) * (
@@ -1115,7 +1118,7 @@ class MCShadingNetwork(nn.Module):
         return colors, outputs
 
     def forward(self, pts, view_dirs, normals, human_poses, step, is_train):
-        view_dirs, normals = F.normalize(view_dirs, dim=-1), F.normalize(normals, dim=-1)
+        view_dirs, normals = safe_normalize(view_dirs, dim=-1), safe_normalize(normals, dim=-1)
         reflections = torch.sum(view_dirs * normals, -1, keepdim=True) * normals * 2 - view_dirs
         metallic, roughness, albedo = self.predict_materials(pts)  # [pn,1] [pn,1] [pn,3]
         return self.shade_mixed(pts, normals, view_dirs, reflections, metallic, roughness, albedo, human_poses,
@@ -1166,7 +1169,7 @@ class MCShadingNetwork(nn.Module):
         reg = 0
 
         if self.cfg['reg_change']:
-            normals = F.normalize(normals, dim=-1)
+            normals = safe_normalize(normals, dim=-1)
             x = self.get_orthogonal_directions(normals)
             y = torch.cross(normals, x)
             ang = torch.rand(pts.shape[0], 1) * np.pi * 2

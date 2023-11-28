@@ -20,6 +20,9 @@ import raymarching
 from nerf2mesh_encoding import get_encoder, MLP
 
 
+def safe_normalize(x, dim=-1, eps=1e-20):
+    return x / torch.sqrt(torch.clamp(torch.sum(x * x, dim, keepdim=True), min=eps))
+
 def build_imgs_info(database: BaseDatabase, img_ids, use_mask=False):
     images = [database.get_image(img_id) for img_id in img_ids]
     poses = [database.get_pose(img_id) for img_id in img_ids]
@@ -138,7 +141,7 @@ class NeROShapeRenderer(nn.Module):
         # dataset
         'database_name': 'nerf_synthetic/lego/black_800',
         'is_blender': False,
-        'use_mask': True,
+        'use_mask': False,
 
         # validation
         'test_downsample_ratio': True,
@@ -478,7 +481,7 @@ class NeROShapeRenderer(nn.Module):
         Y[:, 2] = -1.0
         Z = torch.clone(poses[:, 2, :3])  # pn, 3
         Z[:, 2] = 0
-        Z = F.normalize(Z, dim=-1)
+        Z = safe_normalize(Z, dim=-1)
         X = torch.cross(Y, Z)  # pn, 3
         R = torch.stack([X, Y, Z], 1)  # pn,3,3
         t = -R @ cam_cen[:, :, None]  # pn,3,1
@@ -494,7 +497,7 @@ class NeROShapeRenderer(nn.Module):
         rays_d = rays_d[..., 0]  # rn,3
 
         rays_o = rays_o
-        rays_d = F.normalize(rays_d, dim=-1)
+        rays_d = safe_normalize(rays_d, dim=-1)
         near, far = self.near_far_from_sphere(rays_o, rays_d)
 
         human_poses = self.get_human_coordinate_poses(poses)
@@ -504,7 +507,7 @@ class NeROShapeRenderer(nn.Module):
         idxs = ray_batch['idxs'][..., 0]  # rn
         rays_d = ray_batch['rays_d']
         rays_o = ray_batch['rays_o']
-        rays_d = F.normalize(rays_d, dim=-1)
+        rays_d = safe_normalize(rays_d, dim=-1)
         near, far = torch.full((rays_o.shape[0], 1), 1.0), torch.full((rays_o.shape[0], 1), 3.0)
 
         return rays_o, rays_d, near, far, poses[idxs]  # rn, 3, 4
@@ -524,7 +527,7 @@ class NeROShapeRenderer(nn.Module):
 
     #     rays_d = torch.cat(rays_d, dim=0)
 
-    #     rays_d = F.normalize(rays_d, dim=-1)
+    #     rays_d = safe_normalize(rays_d, dim=-1)
     #     near, far = self.near_far_from_sphere(rays_o, rays_d)
 
     #     human_poses = self.get_human_coordinate_poses(poses)
@@ -588,7 +591,7 @@ class NeROShapeRenderer(nn.Module):
         step,
     ):
         
-        if raymarching:
+        if self.raymarching:
             rn = self.num_rays
         else:
             rn = self.cfg['train_ray_num']
@@ -789,15 +792,15 @@ class NeROShapeRenderer(nn.Module):
         inner_mask = torch.norm(points, dim=-1, keepdim=True) <= 1.0
         outputs = {
             'depth': depth,  # rn,1
-            'normal': ((F.normalize(gradients, dim=-1) + 1.0) * 0.5) * inner_mask,  # rn,3
+            'normal': ((safe_normalize(gradients, dim=-1) + 1.0) * 0.5) * inner_mask,  # rn,3
         }
 
         if self.hash_encoding:
-            _, occ_info, inter_results = self.color_network(points, gradients, -F.normalize(rays_d, dim=-1),
+            _, occ_info, inter_results = self.color_network(points, gradients, -safe_normalize(rays_d, dim=-1),
                                                         human_poses, inter_results=True, step=step)
         else:
             feature_vector = self.sdf_network(points)[..., 1:]  # rn,f
-            _, occ_info, inter_results = self.color_network(points, gradients, -F.normalize(rays_d, dim=-1), 
+            _, occ_info, inter_results = self.color_network(points, gradients, -safe_normalize(rays_d, dim=-1), 
                                                         human_poses, feature_vector, inter_results=True, step=step)
         
         if self.raymarching:
@@ -838,8 +841,8 @@ class NeROShapeRenderer(nn.Module):
         with torch.cuda.amp.autocast(enabled=self.fp16):
             sdfs = self.get_sdf(xyzs_)[...,0]    
         raw_normals = self.get_sdf_gradient(xyzs_)
-        normals = F.normalize(raw_normals, dim=-1)
-        dirs = F.normalize(dirs[inside_mask], dim=-1)
+        normals = safe_normalize(raw_normals, dim=-1)
+        dirs = safe_normalize(dirs[inside_mask], dim=-1)
         true_cos = (dirs * normals).sum(-1)
         inv_s = self.deviation_network(sdfs).clamp(1e-6, 1e6)
         
@@ -924,7 +927,7 @@ class NeROShapeRenderer(nn.Module):
             if self.raymarching:
                 occ_prob_gt = self.get_gt_occ_by_raymarching(points[mask], reflective[mask])
             else:
-                _, inter_prob, _ = get_intersection(self.get_sdf, self.deviation_network, points[mask], reflective[mask],
+                _, inter_prob, _ = get_intersection(self.get_sdf, self.deviation_network, 
                                                                  points[mask], reflective[mask], sn0=64,
                                                                  sn1=16)  # pn,sn-1
                 occ_prob_gt = torch.sum(inter_prob, -1, keepdim=True)
@@ -947,7 +950,7 @@ class NeROShapeRenderer(nn.Module):
 
         dirs = rays_d.unsqueeze(-2).expand(batch_size, n_samples, 3)
         human_poses_pt = human_poses.unsqueeze(-3).expand(batch_size, n_samples, 3, 4)
-        dirs = F.normalize(dirs, dim=-1)
+        dirs = safe_normalize(dirs, dim=-1)
         alpha, sampled_color = torch.zeros(batch_size, n_samples), torch.zeros(batch_size, n_samples, 3)
 
         if torch.sum(outer_mask) > 0:
@@ -1060,19 +1063,20 @@ class NeROShapeRenderer(nn.Module):
         # human_poses_pt = human_poses.unsqueeze(-3).expand(batch_size, n_samples, 3, 4)
         human_poses_pt = None  # not implemented yet
         
-        dirs = F.normalize(dirs, dim=-1)
+        dirs = safe_normalize(dirs, dim=-1)
         alpha, sampled_color = torch.zeros(points_num), torch.zeros(points_num, 3)
 
         if torch.sum(outer_mask) > 0:
             raise
         if torch.sum(inner_mask) > 0:
-            alpha[inner_mask], gradients, feature_vector, inv_s, sdf = self.compute_sdf_alpha(points[inner_mask],
-                                                                                              dists[inner_mask],
-                                                                                              dirs[inner_mask],
-                                                                                              cos_anneal_ratio, step)
-            sampled_color[inner_mask], occ_info = self.color_network(points[inner_mask], gradients, -dirs[inner_mask],
-                                                                     human_poses_pt, feature_vector, 
-                                                                     step=step)
+            with torch.cuda.amp.autocast(enabled=self.fp16):
+                alpha[inner_mask], gradients, feature_vector, inv_s, sdf = self.compute_sdf_alpha(points[inner_mask],
+                                                                                                dists[inner_mask],
+                                                                                                dirs[inner_mask],
+                                                                                                cos_anneal_ratio, step)
+                sampled_color[inner_mask], occ_info = self.color_network(points[inner_mask], gradients, -dirs[inner_mask],
+                                                                        human_poses_pt, feature_vector, 
+                                                                        step=step)
             # Eikonal loss
             outputs['gradient_error'] = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
             outputs['std'] = torch.mean(1 / inv_s)
@@ -1312,7 +1316,7 @@ class NeROMaterialRenderer(nn.Module):
         inters, normals, depth = self.ray_tracer.trace(rays_o, rays_d)
         depth = depth.reshape(*depth.shape, 1)
         normals = -normals
-        normals = F.normalize(normals, dim=-1)
+        normals = safe_normalize(normals, dim=-1)
         if not self.warned_normal:
             print('warn!!! the normals are flipped in NeuS by default. You may flip the normal according to your mesh!')
             self.warned_normal = True
@@ -1340,7 +1344,7 @@ class NeROMaterialRenderer(nn.Module):
         Y[:, 2] = -1.0
         Z = torch.clone(poses[:, 2, :3])  # pn, 3
         Z[:, 2] = 0
-        Z = F.normalize(Z, dim=-1)
+        Z = safe_normalize(Z, dim=-1)
         X = torch.cross(Y, Z)  # pn, 3
         R = torch.stack([X, Y, Z], 1)  # pn,3,3
         t = -R @ cam_cen[:, :, None]  # pn,3,1
@@ -1359,7 +1363,7 @@ class NeROMaterialRenderer(nn.Module):
         poses = imgs_info['poses']  # imn,3,4
         R, t = poses[:, :, :3], poses[:, :, 3:]
         rays_d = rays_d @ R
-        rays_d = F.normalize(rays_d, dim=-1)
+        rays_d = safe_normalize(rays_d, dim=-1)
         rays_o = -R.permute(0, 2, 1) @ t  # imn,3,3 @ imn,3,1
         self._warn_ray_tracing(rays_o)
         rays_o = rays_o.permute(0, 2, 1).repeat(1, h * w, 1)  # imn,h*w,3
