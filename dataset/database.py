@@ -1,6 +1,8 @@
 import abc
 import glob
 import os
+os.environ["OPENCV_IO_ENABLE_OPENEXR"]="1"
+import cv2
 import random
 from pathlib import Path
 
@@ -91,7 +93,7 @@ class GlossyRealDatabase(BaseDatabase):
                  'up': np.asarray((-0.01911, -0.738918, -0.673524), np.float32), },
     }
 
-    def __init__(self, database_name, dataset_dir):
+    def __init__(self, database_name, dataset_dir, split='train'):
         super().__init__(database_name)
         _, self.object_name, self.max_len = database_name.split('/')
 
@@ -228,19 +230,25 @@ class GlossyRealDatabase(BaseDatabase):
     def get_depth(self, img_id):
         img = self.get_image(img_id)
         h, w, _ = img.shape
-        return np.ones([h, w], np.float32), np.ones([h, w], np.bool)
+        return np.ones([h, w], np.float32), np.ones([h, w], np.bool_)
 
 
 class GlossySyntheticDatabase(BaseDatabase):
-    def __init__(self, database_name, dataset_dir):
+    def __init__(self, database_name, dataset_dir, split='train'):
         super().__init__(database_name)
         _, model_name = database_name.split('/')
         RENDER_ROOT = dataset_dir
-        self.root = f'{RENDER_ROOT}/{model_name}'
+        self.split = split
+        if self.split == 'test':
+            self.root = f'{RENDER_ROOT}/{model_name+"_nvs"}'
+        else:
+            self.root = f'{RENDER_ROOT}/{model_name}'
         self.img_num = len(glob.glob(f'{self.root}/*.pkl'))
         self.img_ids = [str(k) for k in range(self.img_num)]
         self.cams = [read_pickle(f'{self.root}/{k}-camera.pkl') for k in range(self.img_num)]
         self.scale_factor = 1.0
+        
+        
 
     def get_image(self, img_id):
         return imread(f'{self.root}/{img_id}.png')[..., :3]
@@ -260,8 +268,13 @@ class GlossySyntheticDatabase(BaseDatabase):
 
     def get_depth(self, img_id):
         assert (self.scale_factor == 1.0)
-        depth = imread(f'{self.root}/{img_id}-depth.png')
-        depth = depth.astype(np.float32) / 65535 * 15
+        if self.split == "test":
+            depth = imread(f"{self.root}/{img_id}-depth0001.exr")[...,0]
+            depth = cv2.imread(f"{self.root}/{img_id}-depth0001.exr",  cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH) 
+            depth *= 255
+        else:
+            depth = imread(f'{self.root}/{img_id}-depth.png')
+            depth = depth.astype(np.float32) / 65535 * 15
         mask = depth < 14.5
         return depth, mask
 
@@ -405,7 +418,7 @@ class CustomDatabase(BaseDatabase):
     def get_depth(self, img_id):
         img = self.get_image(img_id)
         h, w, _ = img.shape
-        return np.ones([h,w],np.float32), np.ones([h, w], np.bool)
+        return np.ones([h,w],np.float32), np.ones([h, w], np.bool_)
 
 
 class NeRFSyntheticDatabase(BaseDatabase):
@@ -434,7 +447,7 @@ class NeRFSyntheticDatabase(BaseDatabase):
                 fname = os.path.join(self.root, frame['file_path'] + '.png')
                 imgs.append(imageio.imread(fname))
                 poses.append(np.array(frame['transform_matrix']))
-            self.imgs = (np.array(imgs) / 255.).astype(np.float32)  # keep all 4 channels (RGBA)
+            self.imgs = np.array(imgs)  # keep all 4 channels (RGBA)
             self.poses = np.array(poses).astype(np.float32)
             counts.append(counts[-1] + self.imgs.shape[0])
 
@@ -454,8 +467,9 @@ class NeRFSyntheticDatabase(BaseDatabase):
             ])
 
     def get_image(self, img_id):
-        imgs = self.imgs[int(img_id)]
-        return imgs[..., :3] * imgs[..., -1:] + (1 - imgs[..., -1:])
+        img = self.imgs[int(img_id)]
+        return img
+        # return imgs[..., :3] * imgs[..., -1:] + (1 - imgs[..., -1:])
         # return imread(f'{self.root}/{img_id}.png')[..., :3]
 
     def get_K(self, img_id):
@@ -484,7 +498,7 @@ class NeRFSyntheticDatabase(BaseDatabase):
         raise NotImplementedError
 
 
-def parse_database_name(database_name: str, dataset_dir: str) -> BaseDatabase:
+def parse_database_name(database_name: str, dataset_dir: str, split='train') -> BaseDatabase:
     name2database = {
         'syn': GlossySyntheticDatabase,
         'real': GlossyRealDatabase,
@@ -493,7 +507,7 @@ def parse_database_name(database_name: str, dataset_dir: str) -> BaseDatabase:
     }
     database_type = database_name.split('/')[0]
     if database_type in name2database:
-        return name2database[database_type](database_name, dataset_dir)
+        return name2database[database_type](database_name, dataset_dir, split)
     else:
         raise NotImplementedError
 

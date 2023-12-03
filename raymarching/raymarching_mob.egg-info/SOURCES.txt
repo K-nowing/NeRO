@@ -1,9 +1,0 @@
-setup.py
-/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/NeRO/raymarching/src/bindings.cpp
-/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/NeRO/raymarching/src/raymarching.cu
-/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/ngp_nero/raymarching/src/bindings.cpp
-/mnt/image-net-full/j1nhwa.kim/interns/injae.kim/code/icml/ngp_nero/raymarching/src/raymarching.cu
-raymarching_mob.egg-info/PKG-INFO
-raymarching_mob.egg-info/SOURCES.txt
-raymarching_mob.egg-info/dependency_links.txt
-raymarching_mob.egg-info/top_level.txt

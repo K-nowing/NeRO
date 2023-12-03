@@ -1,4 +1,5 @@
 import os
+import yaml
 import random
 from pathlib import Path
 
@@ -29,6 +30,7 @@ class Trainer:
             "lr_step": 100000,
             "lr_rate": 0.5,
         },
+        "img_wh": [800, 800],
         "total_step": 300000,
         "train_log_step": 20,
         "val_interval": 10000,
@@ -39,22 +41,31 @@ class Trainer:
         "fp16": False,
     }
 
-    def _init_dataset(self):
-        self.train_set = name2dataset[self.cfg['train_dataset_type']](self.cfg['train_dataset_cfg'], True)
-        self.train_set = DataLoader(self.train_set, 1, True, num_workers=self.cfg['worker_num'],
-                                    collate_fn=dummy_collate_fn)
-        print(f'train set len {len(self.train_set)}')
-        self.val_set_list, self.val_set_names = [], []
-        dataset_dir = self.cfg['dataset_dir']
-        
-        for val_set_cfg in self.cfg['val_set_list']:
-            name, val_type, val_cfg = val_set_cfg['name'], val_set_cfg['type'], val_set_cfg['cfg']
-            val_set = name2dataset[val_type](val_cfg, False, dataset_dir=dataset_dir)
-            val_set = DataLoader(val_set, 1, False, num_workers=self.cfg['worker_num'], collate_fn=dummy_collate_fn)
-            self.val_set_list.append(val_set)
-            self.val_set_names.append(name)
-            print(f'{name} val set len {len(val_set)}')
-
+    def _init_dataset(self, train=True):
+        if train:
+            self.train_set = name2dataset[self.cfg['train_dataset_type']](self.cfg['train_dataset_cfg'], True)
+            self.train_set = DataLoader(self.train_set, 1, True, num_workers=self.cfg['worker_num'],
+                                        collate_fn=dummy_collate_fn)
+            print(f'train set len {len(self.train_set)}')
+            self.val_set_list, self.val_set_names = [], []
+            dataset_dir = self.cfg['dataset_dir']
+            
+            for val_set_cfg in self.cfg['val_set_list']:
+                name, val_type, val_cfg = val_set_cfg['name'], val_set_cfg['type'], val_set_cfg['cfg']
+                val_set = name2dataset[val_type](val_cfg, False, dataset_dir=dataset_dir)
+                val_set = DataLoader(val_set, 1, False, num_workers=self.cfg['worker_num'], collate_fn=dummy_collate_fn)
+                self.val_set_list.append(val_set)
+                self.val_set_names.append(name)
+                print(f'{name} val set len {len(val_set)}')
+        else:
+            test_set_cfg = {}
+            name, test_type, test_cfg = test_set_cfg['name'], test_set_cfg['type'], test_set_cfg['cfg']
+            test_set = name2dataset[test_type](test_cfg, False, dataset_dir=dataset_dir)
+            test_set = DataLoader(test_set, 1, False, num_workers=self.cfg['worker_num'], collate_fn=dummy_collate_fn)
+            self.test_set_list.append(test_set)
+            self.test_set_names.append(name)
+            print(f'{name} test set len {len(test_set)}')
+            
     def _init_network(self):
         self.network = name2renderer[self.cfg['network']](self.cfg, self.cfg['fp16']).cuda()
 
@@ -100,7 +111,13 @@ class Trainer:
         random.seed(self.cfg['random_seed'])
         self.model_name = cfg['name']
         self.model_dir = os.path.join('outputs/model', cfg['name'])
-        if not os.path.exists(self.model_dir): Path(self.model_dir).mkdir(exist_ok=True, parents=True)
+        if not os.path.exists(self.model_dir): 
+            Path(self.model_dir).mkdir(exist_ok=True, parents=True)
+        cfg_path = os.path.join(self.model_dir, 'config.yaml')
+        with open(os.path.join(self.model_dir, 'config.yaml'), 'w') as f: 
+            yaml.dump(self.cfg, f)
+        print(f"Save {cfg_path}.")
+        
         self.pth_fn = os.path.join(self.model_dir, 'model.pth')
         self.best_pth_fn = os.path.join(self.model_dir, 'model_best.pth')
 
@@ -141,7 +158,7 @@ class Trainer:
 
             log_info = {}
             # raymarching: update grid every 16 steps
-            if self.train_network.raymarching and step % self.train_network.update_extra_interval == 0:
+            if self.cfg['network']=='shape' and self.train_network.raymarching and step % self.train_network.update_extra_interval == 0:
                 loss = self.train_network.update_extra_state()
             else:
                 loss = None
@@ -168,7 +185,7 @@ class Trainer:
                 self._log_data(log_info, step + 1, 'train')
             
             # raymarching adaptive_num_rays
-            if self.train_network.raymarching and self.train_network.adaptive_num_rays:
+            if self.cfg['network']=='shape' and self.train_network.raymarching and self.train_network.adaptive_num_rays:
                 self.train_network.num_rays = int(
                     round((self.train_network.num_points / outputs["num_points"]) * self.train_network.num_rays)
                 )
@@ -204,44 +221,42 @@ class Trainer:
 
         pbar.close()
 
-    def test(self, save_dir):
-        import cv2
-        self._init_dataset()
+    def test(self):
+        dataset_dir = self.cfg['dataset_dir']
+        test_type = self.cfg['val_set_list'][0]['type']
+        test_cfg = self.cfg['val_set_list'][0]['cfg']
+        test_cfg['database_name'] = test_cfg['database_name'] + '_nvs'
+        test_set = name2dataset[test_type](test_cfg, False, dataset_dir=dataset_dir, test=True)
+        test_set = DataLoader(test_set, 1, False, num_workers=self.cfg['worker_num'], collate_fn=dummy_collate_fn)
+        
+        print(f'test set len {len(test_set)}')
+        
         self._init_network()
         best_para, start_step = self._load_model()
 
-        # self.network.cfg['test_downsample_ratio'] = False
+        self.network._init_dataset(train=False)
+        self.network.cfg['test_downsample_ratio'] = False
         torch.cuda.empty_cache()
         val_results = {}
         val_para = 0
         step = 0
-        os.makedirs(save_dir, exist_ok=True)
         
-        for vi, val_set in enumerate(self.val_set_list):
-            eval_results, key_metric_val, outputs_dict = self.val_evaluator(
-                self.network, self.val_losses + self.val_metrics, val_set, step,
-                self.model_name, val_set_name=self.val_set_names[vi], return_outputs=True)
+        eval_results, key_metric_val = self.val_evaluator(
+            self.network, self.val_losses + self.val_metrics, test_set, step,
+            self.model_name, val_set_name='test')
 
-            psnr = np.mean(eval_results['psnr'])
-            ssim = np.mean(eval_results['ssim'])
-            print(psnr)
-            print(ssim)
-            
-            for save_result_name in ['ray_rgb', 'normal', 'diffuse_albedo', 'diffuse_light', 'diffuse_color', 'specular_albedo', 'specular_light', 'specular_color', 'specular_ref', 'metallic', 'roughness', 'occ_prob', 'indirect_light', 'occ_prob_gt', 'loss_rgb', 'gt_rgb', 'gt_depth', 'gt_mask']:
-                for i, ret in enumerate(tqdm(outputs_dict[save_result_name][::20])):
-                    ret = ret.view(200,200, -1)
-                    ret = (ret*255).cpu().numpy()
-                    ret = ret[:,:,::-1].astype(np.uint8)
-                    num = str(i).zfill(3)
-                    cv2.imwrite(f'{save_dir}/{save_result_name}_{num}.png', ret)
+        psnr = np.mean(eval_results['psnr'])
+        ssim = np.mean(eval_results['ssim'])
+        print(psnr)
+        print(ssim)
 
-    def _load_model(self):
+    def _load_model(self, strict=False):
         best_para, start_step = 0, 0
         if os.path.exists(self.pth_fn):
             checkpoint = torch.load(self.pth_fn)
             best_para = checkpoint['best_para']
             start_step = checkpoint['step']
-            self.network.load_state_dict(checkpoint['network_state_dict'])
+            self.network.load_state_dict(checkpoint['network_state_dict'], strict=strict)
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
             print(f'==> resuming from step {start_step} best para {best_para}')

@@ -931,3 +931,475 @@ void composite_rays(const uint32_t n_alive, const uint32_t n_step, const float T
         kernel_composite_rays<<<div_round_up(n_alive, N_THREAD), N_THREAD>>>(n_alive, n_step, T_thresh, alpha_mode, rays_alive.data_ptr<int>(), rays_t.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbs.data_ptr<scalar_t>(), ts.data_ptr<scalar_t>(), weights.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image.data_ptr<scalar_t>());
     }));
 }
+
+
+//
+// unceratinty extension
+//
+
+
+// sigmas: [M]
+// rgbbetas: [M, 4]
+// ts: [M, 2]
+// rays: [N, 2], offset, num_steps
+// weights: [M]
+// weights_sum: [N], final pixel alpha
+// depth: [N,]
+// image_beta: [N, 4]
+template <typename scalar_t>
+__global__ void kernel_composite_rays_with_beta_train_forward(
+    const scalar_t * __restrict__ sigmas,
+    const scalar_t * __restrict__ rgbbetas,  
+    const scalar_t * __restrict__ ts,
+    const int * __restrict__ rays,
+    const uint32_t M, const uint32_t N, const float T_thresh, const bool alpha_mode,
+    scalar_t * weights,
+    scalar_t * weights_sum,
+    scalar_t * depth,
+    scalar_t * image_beta
+) {
+    // parallel per ray
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= N) return;
+
+    // locate 
+    uint32_t offset = rays[n * 2];
+    uint32_t num_steps = rays[n * 2 + 1];
+
+    // empty ray, or ray that exceed max step count.
+    if (num_steps == 0 || offset + num_steps > M) {
+        weights_sum[n] = 0;
+        depth[n] = 0;
+        image_beta[n * 4] = 0;
+        image_beta[n * 4 + 1] = 0;
+        image_beta[n * 4 + 2] = 0;
+        image_beta[n * 4 + 3] = 0;
+        return;
+    }
+
+    ts += offset * 2;
+    weights += offset;
+    sigmas += offset;
+    rgbbetas += offset * 4;
+
+    // accumulate 
+    uint32_t step = 0;
+
+    float T = 1.0f;
+    float r = 0, g = 0, b = 0, beta = 0, ws = 0, d = 0;
+
+    while (step < num_steps) {
+
+        const float alpha = alpha_mode ? (float)sigmas[0] : (1.0f - __expf(- sigmas[0] * ts[1]));
+        const float weight = alpha * T;
+
+        weights[0] = weight;
+
+        r += weight * rgbbetas[0];
+        g += weight * rgbbetas[1];
+        b += weight * rgbbetas[2];
+        beta += weight * rgbbetas[3];
+        ws += weight;
+        d += weight * ts[0];
+        
+        T *= 1.0f - alpha;
+
+        // minimal remained transmittence
+        if (T < T_thresh) break;
+
+        //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
+
+        // locate
+        weights++;
+        sigmas++;
+        rgbbetas += 4;
+        ts += 2;
+
+        step++;
+    }
+
+    //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
+
+    // write
+    weights_sum[n] = ws; // weights_sum
+    depth[n] = d;
+    image_beta[n * 4] = r;
+    image_beta[n * 4 + 1] = g;
+    image_beta[n * 4 + 2] = b;
+    image_beta[n * 4 + 3] = beta;
+}
+
+
+void composite_rays_with_beta_train_forward(const at::Tensor sigmas, const at::Tensor rgbbetas, const at::Tensor ts, const at::Tensor rays, const uint32_t M, const uint32_t N, const float T_thresh, const bool alpha_mode, at::Tensor weights, at::Tensor weights_sum, at::Tensor depth, at::Tensor image_beta) {
+
+    static constexpr uint32_t N_THREAD = 128;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    sigmas.scalar_type(), "composite_rays_with_beta_train_forward", ([&] {
+        kernel_composite_rays_with_beta_train_forward<<<div_round_up(N, N_THREAD), N_THREAD>>>(sigmas.data_ptr<scalar_t>(), rgbbetas.data_ptr<scalar_t>(), ts.data_ptr<scalar_t>(), rays.data_ptr<int>(), M, N, T_thresh, alpha_mode, weights.data_ptr<scalar_t>(), weights_sum.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image_beta.data_ptr<scalar_t>());
+    }));
+}
+
+
+// grad_weights: [M,]
+// grad_weights_sum: [N,]
+// grad_image: [N, 4]
+// grad_depth: [N,]
+// sigmas: [M]
+// rgbbetas: [M, 4]
+// ts: [M, 2]
+// rays: [N, 2], offset, num_steps
+// weights_sum: [N,], weights_sum here 
+// image: [N, 4]
+// grad_sigmas: [M]
+// grad_rgbbetas: [M, 4]
+template <typename scalar_t>
+__global__ void kernel_composite_rays_with_beta_train_backward(
+    const scalar_t * __restrict__ grad_weights,
+    const scalar_t * __restrict__ grad_weights_sum,
+    const scalar_t * __restrict__ grad_depth,
+    const scalar_t * __restrict__ grad_image_beta,
+    const scalar_t * __restrict__ sigmas,
+    const scalar_t * __restrict__ rgbbetas, 
+    const scalar_t * __restrict__ ts,
+    const int * __restrict__ rays,
+    const scalar_t * __restrict__ weights_sum,
+    const scalar_t * __restrict__ depth,
+    const scalar_t * __restrict__ image_beta,
+    const uint32_t M, const uint32_t N, const float T_thresh, const bool alpha_mode,
+    scalar_t * grad_sigmas,
+    scalar_t * grad_rgbbetas
+) {
+    // parallel per ray
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= N) return;
+
+    // locate 
+    uint32_t offset = rays[n * 2];
+    uint32_t num_steps = rays[n * 2 + 1];
+
+    if (num_steps == 0 || offset + num_steps > M) return;
+
+    grad_weights += offset;
+    grad_weights_sum += n;
+    grad_depth += n;
+    grad_image_beta += n * 4;
+    weights_sum += n;
+    depth += n;
+    image_beta += n * 4;
+    sigmas += offset;
+    rgbbetas += offset * 4;
+    ts += offset * 2;
+    grad_sigmas += offset;
+    grad_rgbbetas += offset * 4;
+
+    // accumulate 
+    uint32_t step = 0;
+    
+    float T = 1.0f;
+    const float r_final = image_beta[0], g_final = image_beta[1], b_final = image_beta[2], beta_final = image_beta[3], ws_final = weights_sum[0], d_final = depth[0];
+    float r = 0, g = 0, b = 0, beta = 0, ws = 0, d = 0;
+
+    while (step < num_steps) {
+        
+        const float alpha = alpha_mode ? (float)sigmas[0] : (1.0f - __expf(- sigmas[0] * ts[1]));
+        const float weight = alpha * T;
+
+        r += weight * rgbbetas[0];
+        g += weight * rgbbetas[1];
+        b += weight * rgbbetas[2];
+        beta += weight * rgbbetas[3];
+        ws += weight;
+        d += weight * ts[0];
+
+        T *= 1.0f - alpha;
+        
+        // check https://note.kiui.moe/others/nerf_gradient/ for the gradient calculation.
+        // write grad_rgbbetas
+        grad_rgbbetas[0] = grad_image_beta[0] * weight;
+        grad_rgbbetas[1] = grad_image_beta[1] * weight;
+        grad_rgbbetas[2] = grad_image_beta[2] * weight;
+        grad_rgbbetas[3] = grad_image_beta[3] * weight;
+
+        // write grad_sigmas
+        const float grad_scale = alpha_mode ? (1.0f / (1.0f - alpha + 1e-10f)) : (float)ts[1];
+        grad_sigmas[0] = grad_scale * (
+            grad_image_beta[0] * (T * rgbbetas[0] - (r_final - r)) + 
+            grad_image_beta[1] * (T * rgbbetas[1] - (g_final - g)) + 
+            grad_image_beta[2] * (T * rgbbetas[2] - (b_final - b)) +
+            grad_image_beta[3] * (T * rgbbetas[3] - (beta_final - beta)) +
+            (grad_weights_sum[0] + grad_weights[0]) * (T - (ws_final - ws)) + 
+            grad_depth[0] * (T * ts[0] - (d_final - d))
+        );
+
+        //printf("[n=%d] num_steps=%d, T=%f, grad_sigmas=%f, r_final=%f, r=%f\n", n, step, T, grad_sigmas[0], r_final, r);
+        // minimal remained transmittence
+        if (T < T_thresh) break;
+        
+        // locate
+        sigmas++;
+        rgbbetas += 4;
+        ts += 2;
+        grad_weights++;
+        grad_sigmas++;
+        grad_rgbbetas += 4;
+
+        step++;
+    }
+}
+
+
+void composite_rays_with_beta_train_backward(const at::Tensor grad_weights, const at::Tensor grad_weights_sum, const at::Tensor grad_depth, const at::Tensor grad_image_beta, const at::Tensor sigmas, const at::Tensor rgbbetas, const at::Tensor ts, const at::Tensor rays, const at::Tensor weights_sum, const at::Tensor depth, const at::Tensor image_beta, const uint32_t M, const uint32_t N, const float T_thresh, const bool alpha_mode, at::Tensor grad_sigmas, at::Tensor grad_rgbbetas) {
+
+    static constexpr uint32_t N_THREAD = 128;
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    grad_image_beta.scalar_type(), "composite_rays_with_beta_train_backward", ([&] {
+        kernel_composite_rays_with_beta_train_backward<<<div_round_up(N, N_THREAD), N_THREAD>>>(grad_weights.data_ptr<scalar_t>(), grad_weights_sum.data_ptr<scalar_t>(), grad_depth.data_ptr<scalar_t>(), grad_image_beta.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbbetas.data_ptr<scalar_t>(), ts.data_ptr<scalar_t>(), rays.data_ptr<int>(), weights_sum.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image_beta.data_ptr<scalar_t>(), M, N, T_thresh, alpha_mode, grad_sigmas.data_ptr<scalar_t>(), grad_rgbbetas.data_ptr<scalar_t>());
+    }));
+}
+
+template <typename scalar_t>
+__global__ void kernel_composite_rays_with_beta(
+    const uint32_t n_alive, 
+    const uint32_t n_step, 
+    const float T_thresh,
+    const bool alpha_mode,
+    int* rays_alive, 
+    scalar_t* rays_t, 
+    const scalar_t* __restrict__ sigmas, 
+    const scalar_t* __restrict__ rgbbetas, 
+    const scalar_t* __restrict__ ts, 
+    scalar_t* weights_sum, scalar_t* depth, scalar_t* image_beta
+) {
+    const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+    if (n >= n_alive) return;
+
+    const int index = rays_alive[n]; // ray id
+    
+    // locate 
+    sigmas += n * n_step;
+    rgbbetas += n * n_step * 4;
+    ts += n * n_step * 2;
+    
+    rays_t += index;
+    weights_sum += index;
+    depth += index;
+    image_beta += index * 4;
+
+    float t;
+    float d = depth[0], r = image_beta[0], g = image_beta[1], b = image_beta[2], beta = image_beta[3], weight_sum = weights_sum[0];
+
+    // accumulate 
+    uint32_t step = 0;
+    while (step < n_step) {
+        
+        // ray is terminated if t == 0
+        if (ts[0] == 0) break;
+        
+        const float alpha = alpha_mode ? (float)sigmas[0] : (1.0f - __expf(- sigmas[0] * ts[1]));
+
+        /* 
+        T_0 = 1; T_i = \prod_{j=0}^{i-1} (1 - alpha_j)
+        w_i = alpha_i * T_i
+        --> 
+        T_i = 1 - \sum_{j=0}^{i-1} w_j
+        */
+        const float T = 1 - weight_sum;
+        const float weight = alpha * T;
+        weight_sum += weight;
+
+        t = ts[0];
+        d += weight * t; // real depth
+        r += weight * rgbbetas[0];
+        g += weight * rgbbetas[1];
+        b += weight * rgbbetas[2];
+        beta += weight * rgbbetas[3];
+
+        //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
+
+        // ray is terminated if T is too small
+        // use a larger bound to further accelerate inference
+        if (T < T_thresh) break;
+
+        // locate
+        sigmas++;
+        rgbbetas += 4;
+        ts += 2;
+        step++;
+    }
+
+    //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
+
+    // rays_alive = -1 means ray is terminated early.
+    if (step < n_step) {
+        rays_alive[n] = -1;
+    } else {
+        rays_t[0] = t;
+    }
+
+    weights_sum[0] = weight_sum; // this is the thing I needed!
+    depth[0] = d;
+    image_beta[0] = r;
+    image_beta[1] = g;
+    image_beta[2] = b;
+    image_beta[3] = beta;
+}
+
+
+void composite_rays_with_beta(const uint32_t n_alive, const uint32_t n_step, const float T_thresh, const bool alpha_mode, at::Tensor rays_alive, at::Tensor rays_t, at::Tensor sigmas, at::Tensor rgbbetas, at::Tensor ts, at::Tensor weights, at::Tensor depth, at::Tensor image_beta) {
+    static constexpr uint32_t N_THREAD = 128;
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+    image_beta.scalar_type(), "composite_rays_with_beta", ([&] {
+        kernel_composite_rays_with_beta<<<div_round_up(n_alive, N_THREAD), N_THREAD>>>(n_alive, n_step, T_thresh, alpha_mode, rays_alive.data_ptr<int>(), rays_t.data_ptr<scalar_t>(), sigmas.data_ptr<scalar_t>(), rgbbetas.data_ptr<scalar_t>(), ts.data_ptr<scalar_t>(), weights.data_ptr<scalar_t>(), depth.data_ptr<scalar_t>(), image_beta.data_ptr<scalar_t>());
+    }));
+}
+
+
+
+
+
+// // sigmas: [M]
+// // rgbbetas: [M, 4]
+// // ts: [M, 2]
+// // rays: [N, 2], offset, num_steps
+// // weights: [M + bg_M]
+// // weights_sum: [N], final pixel alpha
+// // depth: [N,]
+// // image_beta: [N, 4]
+// template <typename scalar_t>
+// __global__ void kernel_composite_rays_with_beta_train_forward_with_bg(
+//     const scalar_t * __restrict__ sigmas,
+//     const scalar_t * __restrict__ rgbbetas,  
+//     const scalar_t * __restrict__ ts,
+//     const scalar_t * __restrict__ bg_sigmas,
+//     const scalar_t * __restrict__ bg_rgbbetas,  
+//     const scalar_t * __restrict__ bg_ts,
+//     const int * __restrict__ rays,
+//     const int * __restrict__ bg_rays,
+//     const uint32_t M, const uint32_t N, 
+//     const uint32_t bg_M,
+//     const float T_thresh, const bool alpha_mode,
+//     scalar_t * weights,
+//     scalar_t * weights_sum,
+//     scalar_t * depth,
+//     scalar_t * image_beta
+// ) {
+//     // parallel per ray
+//     const uint32_t n = threadIdx.x + blockIdx.x * blockDim.x;
+//     if (n >= N) return;
+
+//     // locate 
+//     uint32_t bg_offset = bg_rays[n * 2];
+//     uint32_t num_pre_steps = bg_rays[n * 2 + 1];
+//     uint32_t num_post_steps = bg_rays[n * 2 + 2];
+
+//     uint32_t offset = rays[n * 2];
+//     uint32_t num_steps = rays[n * 2 + 1];
+
+//     // // empty ray, or ray that exceed max step count.
+//     // if (num_pre_steps + num_post_steps == 0 || bg_offset + num_pre_steps + num_post_steps > bg_M) {
+//     //     weights_sum[n] = 0;
+//     //     depth[n] = 0;
+//     //     image_beta[n * 4] = 0;
+//     //     image_beta[n * 4 + 1] = 0;
+//     //     image_beta[n * 4 + 2] = 0;
+//     //     image_beta[n * 4 + 3] = 0;
+//     //     return;
+//     // }
+
+
+//     // empty ray, or ray that exceed max step count.
+//     if (num_steps == 0 || offset + num_steps > M) {
+//         weights_sum[n] = 0;
+//         depth[n] = 0;
+//         image_beta[n * 4] = 0;
+//         image_beta[n * 4 + 1] = 0;
+//         image_beta[n * 4 + 2] = 0;
+//         image_beta[n * 4 + 3] = 0;
+//         return;
+//     }
+    
+
+//     ts += offset * 2;
+//     weights += offset;
+//     sigmas += offset;
+//     rgbbetas += offset * 4;
+
+//     // accumulate 
+//     float T = 1.0f;
+//     float r = 0, g = 0, b = 0, beta = 0, ws = 0, d = 0;
+
+//     uint32_t pre_step = 0;
+//     while (pre_step < num_pre_steps) {
+
+//         const float alpha = alpha_mode ? (float)bg_sigmas[0] : (1.0f - __expf(- bg_sigmas[0] * bg_ts[1]));
+//         const float weight = alpha * T;
+
+//         weights[0] = weight;
+
+//         r += weight * rgbbetas[0];
+//         g += weight * rgbbetas[1];
+//         b += weight * rgbbetas[2];
+//         beta += weight * rgbbetas[3];
+//         ws += weight;
+//         d += weight * ts[0];
+        
+//         T *= 1.0f - alpha;
+
+//         // minimal remained transmittence
+//         if (T < T_thresh) break;
+
+//         //printf("[n=%d] num_pre_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, pre_step, alpha, weight, T, sum_delta, d);
+
+//         // locate
+//         weights++;
+//         sigmas++;
+//         rgbbetas += 4;
+//         ts += 2;
+
+//         pre_step++;
+//     }
+
+//     uint32_t step = 0;
+
+//     while (step < num_steps) {
+
+//         const float alpha = alpha_mode ? (float)sigmas[0] : (1.0f - __expf(- sigmas[0] * ts[1]));
+//         const float weight = alpha * T;
+
+//         weights[0] = weight;
+
+//         r += weight * rgbbetas[0];
+//         g += weight * rgbbetas[1];
+//         b += weight * rgbbetas[2];
+//         beta += weight * rgbbetas[3];
+//         ws += weight;
+//         d += weight * ts[0];
+        
+//         T *= 1.0f - alpha;
+
+//         // minimal remained transmittence
+//         if (T < T_thresh) break;
+
+//         //printf("[n=%d] num_steps=%d, alpha=%f, w=%f, T=%f, sum_dt=%f, d=%f\n", n, step, alpha, weight, T, sum_delta, d);
+
+//         // locate
+//         weights++;
+//         sigmas++;
+//         rgbbetas += 4;
+//         ts += 2;
+
+//         step++;
+//     }
+
+//     //printf("[n=%d] rgb=(%f, %f, %f), d=%f\n", n, r, g, b, d);
+
+//     // write
+//     weights_sum[n] = ws; // weights_sum
+//     depth[n] = d;
+//     image_beta[n * 4] = r;
+//     image_beta[n * 4 + 1] = g;
+//     image_beta[n * 4 + 2] = b;
+//     image_beta[n * 4 + 3] = beta;
+// }

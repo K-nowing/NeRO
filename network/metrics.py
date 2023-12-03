@@ -28,17 +28,25 @@ def process_key_img(data, h, w):
 def get_key_images(data_pr, keys, h, w):
     results = []
     for k in keys:
-        if k in data_pr: results.append(process_key_img(data_pr[k], h, w))
+        if k in data_pr: 
+            results.append(process_key_img(data_pr[k], h, w))
     return results
 
 
 def draw_materials(data_pr, h, w):
     keys = ['diffuse_albedo', 'diffuse_light', 'diffuse_color',
-            'specular_albedo', 'specular_light', 'specular_color', 'specular_ref',
-            'metallic', 'roughness', 'occ_prob', 'indirect_light']
+            'specular_albedo', 'specular_light', 'specular_color', 
+            'metallic', 'roughness', 'indirect_light', 
+            'occ_prob_gt', 'occ_prob', 'beta_image']
     results = get_key_images(data_pr, keys, h, w)
-    results = [concat_images_list(*results[0:3]), concat_images_list(*results[3:7]), concat_images_list(*results[7:])]
-    return results
+    N_image = len(results)
+    results_ = []
+    div = (N_image-1)//4
+    for i in range(div):
+        results_ += [concat_images_list(*results[i*4:i*4+4])]
+    results_ += [concat_images_list(*results[div*4:])]
+    # results = [concat_images_list(*results[0:3]), concat_images_list(*results[3:7]), concat_images_list(*results[7:])]
+    return results_
 
 
 class ShapeRenderMetrics(Loss):
@@ -52,6 +60,7 @@ class ShapeRenderMetrics(Loss):
         # compute psnr
         rgb_pr = color_map_backward(data_pr['ray_rgb'].detach().cpu().numpy())  # h,w,3
         psnr = compute_psnr(rgb_gt, rgb_pr)
+        abs((rgb_gt-rgb_pr).mean(-1)).astype(np.uint8)
         ssim = structural_similarity(rgb_gt, rgb_pr, win_size=11, channel_axis=2, data_range=255)
         outputs = {'psnr': np.asarray([psnr]), 'ssim': np.asarray([ssim])}
         imgs.append(rgb_pr)
@@ -103,7 +112,7 @@ class MaterialRenderMetrics(Loss):
         # output image
         data_index = kwargs['data_index']
         model_name = kwargs['model_name']
-        output_path = Path(f'data/train_vis/{model_name}')
+        output_path = Path(f'outputs/train_vis/{model_name}')
         output_path.mkdir(exist_ok=True, parents=True)
         imsave(f'{str(output_path)}/{step}-index-{data_index}.jpg', concat_images_list(*output_imgs, vert=True))
         return outputs

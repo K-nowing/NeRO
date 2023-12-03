@@ -1,6 +1,7 @@
 import argparse
 
 from pathlib import Path
+import os
 
 import torch
 import trimesh
@@ -29,9 +30,10 @@ def main():
 
     # output geometry
     mesh = trimesh.Trimesh(vertices, triangles)
-    output_dir = Path('outputs/meshes')
-    output_dir.mkdir(exist_ok=True)
-    mesh.export(str(output_dir / f'{cfg["name"]}-{step}.ply'))
+    save_dir = os.path.join(f'outputs/meshes/{cfg["name"]}')
+    os.makedirs(save_dir, exist_ok=True)
+    output_dir = Path(save_dir)
+    mesh.export(f'{save_dir}/{step}.ply')
 
 
 if __name__ == "__main__":

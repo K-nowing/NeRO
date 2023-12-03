@@ -384,3 +384,94 @@ class _composite_rays(Function):
 
 
 composite_rays = _composite_rays.apply
+
+# ----------------------------------------
+# uncertainty extension
+# ----------------------------------------
+
+class _composite_rays_with_beta_train(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32)
+    def forward(ctx, sigmas, rgbbetas, ts, rays, T_thresh=1e-4, alpha_mode=False):
+        ''' composite rays' rgbbetas, according to the ray marching formula.
+        Args:
+            rgbbetas: float, [M, 4]
+            sigmas: float, [M,]
+            ts: float, [M, 2]
+            rays: int32, [N, 3]
+            alpha_mode: bool, sigmas are treated as alphas instead
+        Returns:
+            weights: float, [M]
+            weights_sum: float, [N,], the alpha channel
+            depth: float, [N, ], the Depth
+            image_beta: float, [N, 4], the RGB channel (after multiplying alpha!)
+        '''
+        
+        sigmas = sigmas.float().contiguous()
+        rgbbetas = rgbbetas.float().contiguous()
+
+        M = sigmas.shape[0]
+        N = rays.shape[0]
+
+        weights = torch.zeros(M, dtype=sigmas.dtype, device=sigmas.device) # may leave unmodified, so init with 0
+        weights_sum = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+
+        depth = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
+        image_beta = torch.empty(N, 4, dtype=sigmas.dtype, device=sigmas.device)
+
+        _backend.composite_rays_with_beta_train_forward(sigmas, rgbbetas, ts, rays, M, N, T_thresh, alpha_mode, weights, weights_sum, depth, image_beta)
+
+        ctx.save_for_backward(sigmas, rgbbetas, ts, rays, weights_sum, depth, image_beta)
+        ctx.dims = [M, N, T_thresh, alpha_mode]
+
+        return weights, weights_sum, depth, image_beta
+    
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_weights, grad_weights_sum, grad_depth, grad_image_beta):
+        
+        grad_weights = grad_weights.contiguous()
+        grad_weights_sum = grad_weights_sum.contiguous()
+        grad_depth = grad_depth.contiguous()
+        grad_image_beta = grad_image_beta.contiguous()
+
+        sigmas, rgbbetas, ts, rays, weights_sum, depth, image_beta = ctx.saved_tensors
+        M, N, T_thresh, alpha_mode = ctx.dims
+   
+        grad_sigmas = torch.zeros_like(sigmas)
+        grad_rgbbetas = torch.zeros_like(rgbbetas)
+
+        _backend.composite_rays_with_beta_train_backward(grad_weights, grad_weights_sum, grad_depth, grad_image_beta, sigmas, rgbbetas, ts, rays, weights_sum, depth, image_beta, M, N, T_thresh, alpha_mode, grad_sigmas, grad_rgbbetas)
+
+        return grad_sigmas, grad_rgbbetas, None, None, None, None
+
+
+composite_rays_with_beta_train = _composite_rays_with_beta_train.apply
+
+
+
+class _composite_rays_with_beta(Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32) # need to cast sigmas & rgbbetas to float
+    def forward(ctx, n_alive, n_step, rays_alive, rays_t, sigmas, rgbbetas, ts, weights_sum, depth, image_beta, T_thresh=1e-2, alpha_mode=False):
+        ''' composite rays' rgbbetas, according to the ray marching formula. (for inference)
+        Args:
+            n_alive: int, number of alive rays
+            n_step: int, how many steps we march
+            rays_alive: int, [n_alive], the alive rays' IDs in N (N >= n_alive)
+            rays_t: float, [N], the alive rays' time
+            sigmas: float, [n_alive * n_step,]
+            rgbbetas: float, [n_alive * n_step, 4]
+            ts: float, [n_alive * n_step, 2]
+        In-place Outputs:
+            weights_sum: float, [N,], the alpha channel
+            depth: float, [N,], the depth value
+            image_beta: float, [N, 4], the RGB channel (after multiplying alpha!)
+        '''
+        sigmas = sigmas.float().contiguous()
+        rgbbetas = rgbbetas.float().contiguous()
+        _backend.composite_rays_with_beta(n_alive, n_step, T_thresh, alpha_mode, rays_alive, rays_t, sigmas, rgbbetas, ts, weights_sum, depth, image_beta)
+        return tuple()
+
+
+composite_rays_with_beta = _composite_rays_with_beta.apply
