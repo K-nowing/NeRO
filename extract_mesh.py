@@ -26,7 +26,7 @@ def main():
     bbox_max = torch.ones(3)
     with torch.no_grad():
         vertices, triangles = extract_geometry(bbox_min, bbox_max, flags.resolution, 0,
-                                               lambda x: network.sdf_network.sdf(x))
+                                               lambda x: network.get_sdf(x))
 
     # output geometry
     mesh = trimesh.Trimesh(vertices, triangles)

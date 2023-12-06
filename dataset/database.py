@@ -270,7 +270,7 @@ class GlossySyntheticDatabase(BaseDatabase):
         assert (self.scale_factor == 1.0)
         if self.split == "test":
             depth = imread(f"{self.root}/{img_id}-depth0001.exr")[...,0]
-            depth = cv2.imread(f"{self.root}/{img_id}-depth0001.exr",  cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH) 
+            # depth = cv2.imread(f"{self.root}/{img_id}-depth0001.exr",  cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH) [..., 0]
             depth *= 255
         else:
             depth = imread(f'{self.root}/{img_id}-depth.png')

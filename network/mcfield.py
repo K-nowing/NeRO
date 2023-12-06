@@ -366,11 +366,9 @@ class LightNetwork(nn.Module):
                  skips=[4],
                  weight_norm = True,
                  exp_max = 5, 
-                 use_viewdirs=False,
-                 beta_dim=1,
-                 use_plucker=False):
+                 use_viewdirs=False):
         super(LightNetwork, self).__init__()
-        self.use_plucker = use_plucker
+        
         self.encoding = nn.Sequential(
             nn.utils.weight_norm(nn.Linear(input_dim, W)),
             nn.ReLU(True),
@@ -389,12 +387,8 @@ class LightNetwork(nn.Module):
             nn.utils.weight_norm(nn.Linear(W//2 , 3)),
             ExpActivation(max_light=exp_max)
         )
-        if self.use_plucker:
-            indirect_input_dim = W + input_dim + xyz_dim + 1
-        else:
-            indirect_input_dim = W + input_dim + xyz_dim
         self.indirect_encoding = nn.Sequential(
-            nn.utils.weight_norm(nn.Linear(indirect_input_dim, W//2)),
+            nn.utils.weight_norm(nn.Linear(W + input_dim + xyz_dim, W//2)),
             nn.ReLU(True),
             nn.utils.weight_norm(nn.Linear(W//2 , W//2 )),
             nn.ReLU(True),
@@ -402,15 +396,12 @@ class LightNetwork(nn.Module):
         
         self.indirect_light = nn.Sequential(nn.Linear(W//2, 3), ExpActivation(max_light=exp_max))
         # self.indirect_alpha = nn.Sequential(nn.Linear(W//2, 1), nn.Sigmoid())
-        self.indirect_alpha = nn.Sequential(nn.Linear(W//2, beta_dim))
-        self.indirect_beta = nn.Sequential(nn.Linear(W//2, beta_dim), nn.Softplus())
+        self.indirect_alpha = nn.Sequential(nn.Linear(W//2, 1))
+        self.indirect_beta = nn.Sequential(nn.Linear(W//2, 1), nn.Softplus())
 
-    def forward(self, ref_roughness, xyz_encoding, p_scale=None):
+    def forward(self, ref_roughness, xyz_encoding):
         direct_light, h = self.forward_direct_light(ref_roughness, True)
-        if self.use_plucker:
-            xyz_skip_h = torch.cat([ref_roughness, xyz_encoding, p_scale, h], -1)
-        else:
-            xyz_skip_h = torch.cat([ref_roughness, xyz_encoding, h], -1)
+        xyz_skip_h = torch.cat([ref_roughness, xyz_encoding, h], -1)
         h = self.indirect_encoding(xyz_skip_h)
         indirect_light = self.indirect_light(h)
         indirect_alpha = self.indirect_alpha(h)
@@ -637,7 +628,7 @@ def get_intersection(sdf_fun, inv_fun, pts, dirs, sn0=128, sn1=9, grid_variance=
     return hit_z_vals, hit_weights, hit_sdf
 
 
-class AppShadingNetwork(nn.Module):
+class COMShadingNetwork(nn.Module):
     default_cfg = {
         'human_light': False,
         'sphere_direction': False,
@@ -653,11 +644,35 @@ class AppShadingNetwork(nn.Module):
         'use_beta': False,
         'beta_min': 0.2,
         
-        'use_plucker': False,
-        'beta_dim': 1,
+        ## mcshading
+        'diffuse_sample_num': 256,
+        'specular_sample_num': 128,
+        # 'diffuse_sample_num': 512,
+        # 'specular_sample_num': 256,
+        'human_lights': True,
+        'light_exp_max': 5.0,
+        'inner_light_exp_max': 5.0,
+        'outer_light_version': 'direction',
+        'geometry_type': 'schlick',
+
+        'reg_change': True,
+        'change_eps': 0.05,
+        'change_type': 'gaussian',
+        'reg_lambda1': 0.005,
+        'reg_min_max': True,
+
+        'random_azimuth': True,
+        'is_real': False,
+        
+        'direct_light': True,
+        'indirect_light': True,
+        
+        'equirect_env_light': False,
+        'env_map': False,
+        'feature_size': 0,
     }
 
-    def __init__(self, cfg, bound=1, hash_encoding=False, fp16=False):
+    def __init__(self, cfg, ray_trace_fun=None, bound=1, hash_encoding=False, fp16=False):
         super().__init__()
         self.cfg = {**self.default_cfg, **cfg}
         self.hash_encoding = hash_encoding
@@ -680,6 +695,8 @@ class AppShadingNetwork(nn.Module):
             self.roughness_predictor = make_predictor(in_dim_material + 3, 1, 64, 3)
             if self.cfg['roughness_init'] != 0:
                 nn.init.constant_(self.roughness_predictor[-2].bias, self.cfg['roughness_init'])
+                
+            self.indirect_point_encoder = make_predictor(in_dim_material + 3, 3, 64, 4)
         else:
             feats_dim = 256
             self.albedo_predictor = make_predictor(feats_dim + 3, 3, 256, 4)
@@ -689,54 +706,91 @@ class AppShadingNetwork(nn.Module):
             self.roughness_predictor = make_predictor(feats_dim + 3, 1, 256, 4)
             if self.cfg['roughness_init'] != 0:
                 nn.init.constant_(self.roughness_predictor[-2].bias, self.cfg['roughness_init'])
-        
-        if self.cfg['use_fglu']:
-            FG_LUT = torch.from_numpy(np.fromfile('assets/bsdf_256_256.bin', dtype=np.float32).reshape(1, 256, 256, 2))
-            self.register_buffer('FG_LUT', FG_LUT)
-
-        if self.cfg['nero_ide']:
-            self.sph_enc = generate_ide_fn(5)
-            sph_dim = 72
-        else:
-            self.sph_enc, sph_dim = get_encoder("ide", degree=5)
-        self.dir_enc, dir_dim = get_embedder(6, 3)
-        self.pos_enc, pos_dim = get_embedder(self.cfg['light_pos_freq'], 3)
-        exp_max = self.cfg['light_exp_max']
-        # outer lights are direct lights
-        if self.cfg['use_beta']:
-            # self.light_network = LightNetwork(sph_dim, pos_dim)
-            # exp_max = 5.0
-            self.beta_dim = self.cfg['beta_dim']
-            if self.cfg['use_fglu']:
-                self.light_network = LightNetwork(sph_dim, pos_dim, exp_max=0.0, use_plucker=self.cfg['use_plucker'], beta_dim=self.beta_dim)
-            else:
-                self.light_network = LightNetwork(sph_dim, pos_dim, exp_max=5.0, use_plucker=self.cfg['use_plucker'], beta_dim=self.beta_dim)
-            nn.init.constant_(self.light_network.indirect_light[-2].bias, np.log(0.5))
-            nn.init.constant_(self.light_network.direct_light[-2].bias, np.log(0.5))
-            nn.init.constant_(self.light_network.indirect_alpha[-1].bias, self.cfg['inner_init'])
                 
-        else:
-            if self.cfg['sphere_direction']:
-                self.outer_light = make_predictor(sph_dim * 2, 3, 256, 4, last_activation='exp', exp_max=exp_max)
-            else:
-                self.outer_light = make_predictor(sph_dim, 3, 256, 4, last_activation='exp', exp_max=exp_max)
-            nn.init.constant_(self.outer_light[-2].bias, np.log(0.5))
+            self.indirect_point_encoder = make_predictor(feats_dim + 3, 16*5, 256, 4)
+        
+        # if self.cfg['use_fglu']:
+        #     FG_LUT = torch.from_numpy(np.fromfile('assets/bsdf_256_256.bin', dtype=np.float32).reshape(1, 256, 256, 2))
+        #     self.register_buffer('FG_LUT', FG_LUT)
 
-            # inner lights are indirect lights
-            if self.cfg['use_beta']:
-                self.inner_light = make_predictor(pos_dim + sph_dim, 4, 256, 4, last_activation='none')
-            else:
-                self.inner_light = make_predictor(pos_dim + sph_dim, 3, 256, 4, last_activation='exp', exp_max=exp_max)
-                nn.init.constant_(self.inner_light[-2].bias, np.log(0.5))
+        # if self.cfg['nero_ide']:
+        #     self.sph_enc = generate_ide_fn(5)
+        #     sph_dim = 72
+        # else:
+        #     self.sph_enc, sph_dim = get_encoder("ide", degree=5)
+        # self.dir_enc, dir_dim = get_embedder(6, 3)
+        # self.pos_enc, pos_dim = get_embedder(self.cfg['light_pos_freq'], 3)
+        # exp_max = self.cfg['light_exp_max']
+        # # outer lights are direct lights
+        # if self.cfg['use_beta']:
+        #     if self.cfg['use_fglu']:
+        #         self.light_network = LightNetwork(sph_dim, pos_dim, exp_max=0.0)
+        #     else:
+        #         self.light_network = LightNetwork(sph_dim, pos_dim, exp_max=5.0)
+        #     nn.init.constant_(self.light_network.indirect_light[-2].bias, np.log(0.5))
+        #     nn.init.constant_(self.light_network.direct_light[-2].bias, np.log(0.5))
+        #     nn.init.constant_(self.light_network.indirect_alpha[-1].bias, self.cfg['inner_init'])
+                
+        # else:
+        #     if self.cfg['sphere_direction']:
+        #         self.outer_light = make_predictor(sph_dim * 2, 3, 256, 4, last_activation='exp', exp_max=exp_max)
+        #     else:
+        #         self.outer_light = make_predictor(sph_dim, 3, 256, 4, last_activation='exp', exp_max=exp_max)
+        #     nn.init.constant_(self.outer_light[-2].bias, np.log(0.5))
 
-            self.inner_weight = make_predictor(pos_dim + dir_dim, 1, 256, 4, last_activation='none')
-            nn.init.constant_(self.inner_weight[-2].bias, self.cfg['inner_init'])
+        #     # inner lights are indirect lights
+        #     if self.cfg['use_beta']:
+        #         self.inner_light = make_predictor(pos_dim + sph_dim, 4, 256, 4, last_activation='none')
+        #     else:
+        #         self.inner_light = make_predictor(pos_dim + sph_dim, 3, 256, 4, last_activation='exp', exp_max=exp_max)
+        #         nn.init.constant_(self.inner_light[-2].bias, np.log(0.5))
+
+        #     self.inner_weight = make_predictor(pos_dim + dir_dim, 1, 256, 4, last_activation='none')
+        #     nn.init.constant_(self.inner_weight[-2].bias, self.cfg['inner_init'])
+        # bg_module = -1.897 * torch.ones((1, 512, 1024, 3))
+        # self.register_parameter('bg_module', nn.Parameter(bg_module))
+        from network.integral_equirect import IntegralEquirect
+        self.bg_module = IntegralEquirect(
+            bg_resolution=512,
+            feature_size=self.cfg['feature_size'],
+            mipbias=0,
+            activation="exp",
+            lr=0.001,
+            init_val=-1.897,
+            mul_lr=0.001,
+            brightness_lr=0,
+            betas=[0.0, 0.0],
+            mul_betas=[0.9, 0.9],
+            mipbias_lr=1e-4,
+            mipnoise=0.0,
+        )
+        indirect_bg_module = -1.897 * torch.ones((1, 512, 1024, 16))
+        self.register_parameter('indirect_bg_module', nn.Parameter(indirect_bg_module))
+        self.outer_light = None
             
 
         # human lights are the lights reflected from the photo capturer
         if self.cfg['human_light']:
             self.human_light_predictor = make_predictor(2 * 2 * 6, 4, 256, 4, last_activation='exp')
             nn.init.constant_(self.human_light_predictor[-2].bias, np.log(0.01))
+            
+        # predefined diffuse sample directions
+        az, el = sample_sphere(self.cfg['diffuse_sample_num'], 0)
+        az, el = az * 0.5 / np.pi, 1 - 2 * el / np.pi  # scale to [0,1]
+        self.diffuse_direction_samples = np.stack([az, el], -1)
+        self.diffuse_direction_samples = torch.from_numpy(
+            self.diffuse_direction_samples.astype(np.float32)).cuda()  # [dn0,2]
+
+        az, el = sample_sphere(self.cfg['specular_sample_num'], 0)
+        az, el = az * 0.5 / np.pi, 1 - 2 * el / np.pi  # scale to [0,1]
+        self.specular_direction_samples = np.stack([az, el], -1)
+        self.specular_direction_samples = torch.from_numpy(
+            self.specular_direction_samples.astype(np.float32)).cuda()  # [dn1,2]
+
+        az, el = sample_sphere(8192, 0)
+        light_pts = az_el_to_points(az, el)
+        self.register_buffer('light_pts', torch.from_numpy(light_pts.astype(np.float32)))
+        self.ray_trace_fun = ray_trace_fun
 
     def predict_human_light(self, points, reflective, human_poses, roughness):
         inter, dists, hits = get_camera_plane_intersection(points, reflective, human_poses)
@@ -757,23 +811,11 @@ class AppShadingNetwork(nn.Module):
         return human_lights, human_weights
 
     def predict_specular_lights(self, points, reflective, roughness, human_poses, step):
-        if self.cfg['use_plucker']:
-            # reflective norm should be 1
-            cross = torch.cross(points, reflective, dim=-1)
-            # plucker = torch.cat((reflective, cross), dim=-1)
-            plucker_scale = torch.sum(points * reflective, dim=-1, keepdim=True)
-        
-        
         ref_roughness = self.sph_enc(reflective, roughness)
         human_light, human_weight = 0, 0
         if self.cfg['use_beta']:
-            
-            if self.cfg['use_plucker']:
-                pts_enc = self.pos_enc(cross)
-                direct_light, indirect_light, occ_prob, light_beta = self.light_network(ref_roughness, pts_enc, plucker_scale)
-            else:
-                pts_enc = self.pos_enc(points)
-                direct_light, indirect_light, occ_prob, light_beta = self.light_network(ref_roughness, pts_enc)
+            pts_enc = self.pos_enc(points)
+            direct_light, indirect_light, occ_prob, light_beta = self.light_network(ref_roughness, pts_enc)
             occ_prob = occ_prob * 0.5 + 0.5
             occ_prob = torch.clamp(occ_prob, min=0, max=1)
             light_beta = occ_prob*light_beta
@@ -796,17 +838,15 @@ class AppShadingNetwork(nn.Module):
                     direct_light = self.outer_light(ref_roughness)
 
             if self.cfg['indirect_light']:
-                if self.cfg['use_plucker']:
-                    raise
-                else:
-                    pts = self.pos_enc(points)
-                    indirect_light = self.inner_light(torch.cat([pts, ref_roughness], -1))
+                pts = self.pos_enc(points)
+                indirect_light = self.inner_light(torch.cat([pts, ref_roughness], -1))
                 
             if self.cfg['direct_light'] and self.cfg['indirect_light']:
                 ref_ = self.dir_enc(reflective)
-                occ_prob = self.inner_weight(torch.cat([pts.detach(), ref_.detach()], -1))  # this is occlusion prob
-                occ_prob = occ_prob * 0.5 + 0.5
-                occ_prob_ = torch.clamp(occ_prob, min=0, max=1)
+                with torch.cuda.amp.autocast(enabled=self.fp16):
+                    occ_prob = self.inner_weight(torch.cat([pts.detach(), ref_.detach()], -1))  # this is occlusion prob
+                    occ_prob = occ_prob * 0.5 + 0.5
+                    occ_prob_ = torch.clamp(occ_prob, min=0, max=1)
 
                 light = indirect_light * occ_prob_ + (human_light * human_weight + direct_light * (1 - human_weight)) * (
                             1 - occ_prob_)
@@ -837,78 +877,203 @@ class AppShadingNetwork(nn.Module):
                 light = self.outer_light(ref)
         return light
 
-    def forward(self, points, normals, o_dirs, human_poses, feature_vectors=None, inter_results=False, step=None):
+    def forward(self, points, normals, o_dirs, human_poses, feature_vectors=None, inter_results=False, step=None, is_train=True):
         normals = safe_normalize(normals, dim=-1)
         o_dirs = safe_normalize(o_dirs, dim=-1)
         reflective = torch.sum(o_dirs * normals, -1, keepdim=True) * normals * 2 - o_dirs
         NoV = torch.sum(normals * o_dirs, -1, keepdim=True)
 
-        if self.hash_encoding:
-            albedo, metallic, roughness = self.predict_materials(points)
-        else:
-            albedo, metallic, roughness = self.predict_materials(points, feature_vectors)
-        # diffuse light
-        diffuse_light = self.predict_diffuse_lights(points, normals)
-        diffuse_albedo = (1 - metallic) * albedo
-        diffuse_color = diffuse_albedo * diffuse_light
-
-        # specular light
-        specular_albedo = 0.04 * (1 - metallic) + metallic * albedo
+        with torch.cuda.amp.autocast(enabled=self.fp16):
+            if self.hash_encoding:
+                albedo, metallic, roughness, p_feat = self.predict_materials(points, return_feat=True)
+            else:
+                albedo, metallic, roughness, p_feat = self.predict_materials(points, feature_vectors, return_feat=True)
+        F0 = 0.04 * (1 - metallic) + metallic * albedo  # [pn,1]
         
-        specular_light, occ_prob, indirect_light, human_light, light_beta = self.predict_specular_lights(points,
-                                                                                            reflective, roughness,
-                                                                                            human_poses, step)
+        with torch.cuda.amp.autocast(enabled=self.fp16):
+            # diffuse light
+            diffuse_directions = self.sample_diffuse_directions(normals, is_train)  # [pn,sn0,3]
+            point_num, diffuse_num, _ = diffuse_directions.shape
+            # sample specular directions
+            specular_directions = self.sample_specular_directions(reflective, roughness, is_train)  # [pn,sn1,3]
+            specular_num = specular_directions.shape[1]
 
-        if self.cfg['use_fglu']:
-            fg_uv = torch.cat([torch.clamp(NoV, min=0.0, max=1.0), torch.clamp(roughness, min=0.0, max=1.0)], -1)
-            pn, bn = points.shape[0], 1
-            fg_lookup = dr.texture(self.FG_LUT, fg_uv.reshape(1, pn // bn, bn, -1).contiguous(), filter_mode='linear',
-                                boundary_mode='clamp').reshape(pn, 2)
-            specular_ref = (specular_albedo * fg_lookup[:, 0:1] + fg_lookup[:, 1:2])
-        else:
-            specular_ref = specular_albedo
-        specular_color = specular_ref * specular_light
+            # diffuse sample prob
+            NoL_d = saturate_dot(diffuse_directions, normals.unsqueeze(1))
+            diffuse_probability = NoL_d / np.pi * (diffuse_num / (specular_num + diffuse_num))
+
+            # specualr sample prob
+            H_s = (o_dirs.unsqueeze(1) + specular_directions)  # [pn,sn0,3] half vector
+            H_s = safe_normalize(H_s, dim=-1)
+            NoH_s = saturate_dot(normals.unsqueeze(1), H_s)
+            VoH_s = saturate_dot(o_dirs.unsqueeze(1), H_s)
+            specular_probability = self.distribution_ggx(NoH_s, roughness.unsqueeze(1)) * NoH_s / (4 * VoH_s + 1e-5) * (
+                        specular_num / (specular_num + diffuse_num))  # D * NoH / (4 * VoH)
+
+            # combine
+            directions = torch.cat([diffuse_directions, specular_directions], 1)
+            probability = torch.cat([diffuse_probability, specular_probability], 1)
+            sn = diffuse_num + specular_num
+
+            # specular
+            fresnel, H, HoV = self.fresnel_schlick_directions(F0.unsqueeze(1), o_dirs.unsqueeze(1), directions)
+            NoV = saturate_dot(normals, o_dirs).unsqueeze(1)  # pn,1,3
+            NoL = saturate_dot(normals.unsqueeze(1), directions)  # pn,sn,3
+            geometry = self.geometry(NoV, NoL, roughness.unsqueeze(1))
+            NoH = saturate_dot(normals.unsqueeze(1), H)
+            distribution = self.distribution_ggx(NoH, roughness.unsqueeze(1))
+            human_poses = human_poses.unsqueeze(1).repeat(1, sn, 1, 1) if human_poses is not None else None
+            pts_ = points.unsqueeze(1).repeat(1, sn, 1)
+            light_point_feat = self.indirect_point_encoder(p_feat)
+            light_point_feat = light_point_feat.unsqueeze(1).repeat(1, sn, 1)  # pn,sn,64*5
+            # lights, hl, light_pts, light_normals, light_pts_mask = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
+            # lights = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
+            # lights = self.get_lights(pts_, directions, human_poses, roughness)  # pn,sn,3
+
+            
+            outer_lights, inner_light, alpha, beta = self.get_lights(pts_, directions, human_poses, roughness, light_point_feat)  # pn,sn,3
+            lights = outer_lights * (1-alpha.unsqueeze(-1)) + inner_light * alpha.unsqueeze(-1)
+            
+
+            
+            specular_weights = distribution * geometry / (4 * NoV * probability + 1e-5)
+            specular_lights = lights * specular_weights
+            specular_colors = torch.mean(fresnel * specular_lights, 1)
+            specular_weights = specular_weights * fresnel
+        
+            occ_prob = torch.mean(alpha.unsqueeze(-1) * specular_weights, 1) ## check
+            light_beta = torch.mean(beta.unsqueeze(-1) * specular_weights, 1)
+
+        # diffuse only consider diffuse directions
+        kd = (1 - metallic.unsqueeze(1))
+        diffuse_lights = lights[:, :diffuse_num]
+        diffuse_colors = albedo.unsqueeze(1) * kd[:, :diffuse_num] * diffuse_lights
+        diffuse_colors = torch.mean(diffuse_colors, 1)
+
+        colors = diffuse_colors + specular_colors
+        colors = linear_to_srgb(colors)
+        
+                
+        # diffuse_light = self.predict_diffuse_lights(points, normals)
+        # diffuse_albedo = (1 - metallic) * albedo
+        # diffuse_color = diffuse_albedo * diffuse_light
+
+        # # specular light
+        # specular_albedo = 0.04 * (1 - metallic) + metallic * albedo
+        
+        # specular_light, occ_prob, indirect_light, human_light, light_beta = self.predict_specular_lights(points,
+        #                                                                                     reflective, roughness,
+        #                                                                                     human_poses, step)
+        # occ_prob, indirect_light
+
+        # if self.cfg['use_fglu']:
+        #     fg_uv = torch.cat([torch.clamp(NoV, min=0.0, max=1.0), torch.clamp(roughness, min=0.0, max=1.0)], -1)
+        #     pn, bn = points.shape[0], 1
+        #     fg_lookup = dr.texture(self.FG_LUT, fg_uv.reshape(1, pn // bn, bn, -1).contiguous(), filter_mode='linear',
+        #                         boundary_mode='clamp').reshape(pn, 2)
+        #     specular_ref = (specular_albedo * fg_lookup[:, 0:1] + fg_lookup[:, 1:2])
+        # else:
+        #     specular_ref = specular_albedo
+        # specular_color = specular_ref * specular_light
 
         # integrated together
-        color = diffuse_color + specular_color
+        # color = diffuse_color + specular_color
 
-        # gamma correction
-        diffuse_color = linear_to_srgb(diffuse_color)
-        specular_color = linear_to_srgb(specular_color)
-        color = linear_to_srgb(color)
-        color = torch.clamp(color, min=0.0, max=1.0)
+        # # gamma correction
+        # diffuse_color = linear_to_srgb(diffuse_color)
+        # specular_color = linear_to_srgb(specular_color)
+        # color = linear_to_srgb(color)
+        # colors = torch.clamp(colors, min=0.0, max=1.0)
 
-        occ_info = {
+        outputs = {
             'reflective': reflective,
             'occ_prob': occ_prob,
             'light_beta': light_beta, 
         }
-
         if inter_results:
+            empty = torch.zeros_like(F0)
+            diffuse_albedo = torch.mean(albedo.unsqueeze(1) * kd[:, :diffuse_num], dim=1)
             intermediate_results = {
-                'specular_albedo': specular_albedo,
-                'specular_ref': torch.clamp(specular_ref, min=0.0, max=1.0),
-                'specular_light': torch.clamp(linear_to_srgb(specular_light), min=0.0, max=1.0),
-                'specular_color': torch.clamp(specular_color, min=0.0, max=1.0),
+                'specular_albedo': F0,
+                'specular_ref': empty,
+                'specular_light': torch.clamp(linear_to_srgb(torch.mean(specular_lights, dim=1)), min=0, max=1),
+                'specular_color': torch.clamp(specular_colors, min=0.0, max=1.0),
 
                 'diffuse_albedo': diffuse_albedo,
-                'diffuse_light': torch.clamp(linear_to_srgb(diffuse_light), min=0.0, max=1.0),
-                'diffuse_color': torch.clamp(diffuse_color, min=0.0, max=1.0),
+                'diffuse_light': torch.clamp(linear_to_srgb(torch.mean(diffuse_lights, dim=1)), min=0, max=1),
+                'diffuse_color': torch.clamp(diffuse_colors, min=0.0, max=1.0),
 
                 'metallic': metallic,
                 'roughness': roughness,
 
-                'occ_prob': torch.clamp(occ_prob, max=1.0, min=0.0),
-                'indirect_light': indirect_light,
+                'occ_prob': empty[..., 0:1],
+                # torch.clamp(occ_prob, max=1.0, min=0.0),
+                'indirect_light': empty,
             }
-            if self.cfg['human_light']:
-                intermediate_results['human_light'] = linear_to_srgb(human_light)
-            return color, occ_info, intermediate_results
-        else:
-            return color, occ_info,
+            return colors, outputs, intermediate_results
+        outputs['albedo'] = albedo
+        outputs['roughness'] = roughness
+        outputs['metallic'] = metallic
+        # outputs['human_lights'] = hl.reshape(-1, 3)
+        # outputs['diffuse_light'] = torch.clamp(linear_to_srgb(torch.mean(diffuse_lights, dim=1)), min=0, max=1)
+        # outputs['specular_light'] = torch.clamp(linear_to_srgb(torch.mean(specular_lights, dim=1)), min=0, max=1)
+        # diffuse_colors = torch.clamp(linear_to_srgb(diffuse_colors), min=0, max=1)
+        # specular_colors = torch.clamp(linear_to_srgb(specular_colors), min=0, max=1)
+        # outputs['diffuse_color'] = diffuse_colors
+        # outputs['specular_color'] = specular_colors
+        outputs['approximate_light'] = torch.clamp(
+            linear_to_srgb(torch.mean(kd[:, :diffuse_num] * diffuse_lights, dim=1) + specular_colors), min=0, max=1)
+        return colors, outputs,
 
-
-    def predict_materials(self, points, features=None):
+    def get_lights(self, pts_, directions, human_poses, roughness, light_point_feat):
+        # d_shape = directions.shape
+        # a, b, c = directions[..., 0:1], directions[..., 1:2], directions[..., 2:3]
+        # norm2d = torch.sqrt(a**2 + b**2)
+        # phi = safemath.atan2(b, a)
+        # theta = safemath.atan2(c, norm2d)
+        # coords = torch.cat([(phi % (2 * math.pi) - math.pi) / math.pi,-theta / math.pi * 2,],dim=1,)
+        # x = coords.reshape(1, 1, -1, 2)
+        # x = (x + 1) / 2  # [-1,1] -> [0,1]
+        
+        # outer_lights = dr.texture(self.bg_module, x.contiguous(), filter_mode='linear',
+        #                         boundary_mode='clamp').reshape(-1, 3)
+        # outer_lights = torch.exp(outer_lights.clip(max=20))
+        # outer_lights = outer_lights.view(d_shape)
+        
+        shape = directions.shape
+        roughness = roughness.repeat(1, shape[1]).view(-1)
+        directions = directions.view(-1, 3)
+        outer_lights = self.bg_module(directions, roughness)
+        outer_lights = outer_lights.view(shape)
+        
+        if self.indirect_bg_module is not None:
+            a, b, c = directions[..., 0:1], directions[..., 1:2], directions[..., 2:3]
+            norm2d = torch.sqrt(a**2 + b**2)
+            phi = safemath.atan2(b, a)
+            theta = safemath.atan2(c, norm2d)
+            coords = torch.cat([(phi % (2 * math.pi) - math.pi) / math.pi,-theta / math.pi * 2,],dim=1,)
+            x = coords.reshape(1, 1, -1, 2)
+            x = (x + 1) / 2  # [-1,1] -> [0,1]
+            
+            id_feature = dr.texture(self.indirect_bg_module, x.contiguous(), filter_mode='linear',
+                        boundary_mode='clamp').reshape(-1, 16)
+            
+            # point_feature = self.indirect_emb_net(xyz_)
+            # point_feature = point_feature.view(-1, 64, 5)
+            light_point_feat = light_point_feat.view(-1, 16, 5)
+            
+            inner_light_alpha_beta = (id_feature.unsqueeze(-1) * light_point_feat).sum(-2)
+            inner_lights = torch.exp(inner_light_alpha_beta[..., :3].clamp(max=20.))
+            alpha = torch.sigmoid(inner_light_alpha_beta[..., 3])
+            beta = alpha * F.softplus(inner_light_alpha_beta[..., 4])
+            
+            inner_lights = inner_lights.view(shape)
+            alpha = alpha.view(shape[:-1])
+            beta = beta.view(shape[:-1])
+            
+        return outer_lights, inner_lights, alpha, beta
+        
+    def predict_materials(self, points, features=None, return_feat=False):
         if self.hash_encoding:
             h = self.encoder_material(points, bound=self.bound, max_level=self.max_level)
             h = torch.cat([points, h], dim=-1)
@@ -917,7 +1082,117 @@ class AppShadingNetwork(nn.Module):
         albedo = self.albedo_predictor(h)
         metallic = self.metallic_predictor(h)
         roughness = self.roughness_predictor(h)
-        return albedo, metallic, roughness
+        rmax, rmin = 1.0, 0.04 ** 2
+        roughness = roughness * (rmax - rmin) + rmin
+        if return_feat:
+            return albedo, metallic, roughness, h
+        else:
+            return albedo, metallic, roughness
+    
+    def fresnel_schlick(self, F0, HoV):
+        return F0 + (1.0 - F0) * torch.clamp(1.0 - HoV, min=0.0, max=1.0) ** 5.0
+
+    def fresnel_schlick_directions(self, F0, view_dirs, directions):
+        H = (view_dirs + directions)  # [pn,sn0,3]
+        H = safe_normalize(H, dim=-1)
+        HoV = torch.clamp(torch.sum(H * view_dirs, dim=-1, keepdim=True), min=0.0, max=1.0)  # [pn,sn0,1]
+        fresnel = self.fresnel_schlick(F0, HoV)  # [pn,sn0,1]
+        return fresnel, H, HoV
+
+    def geometry_schlick_ggx(self, NoV, roughness):
+        a = roughness  # a = roughness**2: we assume the predicted roughness is already squared
+
+        k = a / 2
+        num = NoV
+        denom = NoV * (1 - k) + k
+        return num / (denom + 1e-5)
+
+    def geometry_schlick(self, NoV, NoL, roughness):
+        ggx2 = self.geometry_schlick_ggx(NoV, roughness)
+        ggx1 = self.geometry_schlick_ggx(NoL, roughness)
+        return ggx2 * ggx1
+
+    def geometry_ggx_smith_correlated(self, NoV, NoL, roughness):
+        def fun(alpha2, cos_theta):
+            # cos_theta = torch.clamp(cos_theta,min=1e-7,max=1-1e-7)
+            cos_theta2 = cos_theta ** 2
+            tan_theta2 = (1 - cos_theta2) / (cos_theta2 + 1e-7)
+            return 0.5 * torch.sqrt(1 + alpha2 * tan_theta2) - 0.5
+
+        alpha_sq = roughness ** 2
+        return 1.0 / (1.0 + fun(alpha_sq, NoV) + fun(alpha_sq, NoL))
+
+    def distribution_ggx(self, NoH, roughness):
+        a = roughness
+        a2 = a ** 2
+        NoH2 = NoH ** 2
+        denom = NoH2 * (a2 - 1.0) + 1.0
+        return a2 / (np.pi * denom ** 2 + 1e-4)
+
+    def geometry(self, NoV, NoL, roughness):
+        if self.cfg['geometry_type'] == 'schlick':
+            geometry = self.geometry_schlick(NoV, NoL, roughness)
+        elif self.cfg['geometry_type'] == 'ggx_smith':
+            geometry = self.geometry_ggx_smith_correlated(NoV, NoL, roughness)
+        else:
+            raise NotImplementedError
+        return geometry
+    
+    def get_orthogonal_directions(self, directions):
+        x, y, z = torch.split(directions, 1, dim=-1)  # pn,1
+        otho0 = torch.cat([y, -x, torch.zeros_like(x)], -1)
+        otho1 = torch.cat([-z, torch.zeros_like(x), x], -1)
+        mask0 = torch.norm(otho0, dim=-1) > torch.norm(otho1, dim=-1)
+        mask1 = ~mask0
+        otho = torch.zeros_like(directions)
+        otho[mask0] = otho0[mask0]
+        otho[mask1] = otho1[mask1]
+        otho = safe_normalize(otho, dim=-1)
+        return otho
+
+    def sample_diffuse_directions(self, normals, is_train):
+        # normals [pn,3]
+        z = normals  # pn,3
+        x = self.get_orthogonal_directions(normals)  # pn,3
+        y = torch.cross(z, x, dim=-1)  # pn,3
+        # y = torch.cross(z, x, dim=-1) # pn,3
+
+        # project onto this tangent space
+        az, el = torch.split(self.diffuse_direction_samples, 1, dim=1)  # sn,1
+        el, az = el.unsqueeze(0), az.unsqueeze(0)
+        az = az * np.pi * 2
+        el_sqrt = torch.sqrt(el + 1e-7)
+        if is_train and self.cfg['random_azimuth']:
+            az = (az + torch.rand(z.shape[0], 1, 1) * np.pi * 2) % (2 * np.pi)
+        coeff_z = torch.sqrt(1 - el + 1e-7)
+        coeff_x = el_sqrt * torch.cos(az)
+        coeff_y = el_sqrt * torch.sin(az)
+
+        directions = coeff_x * x.unsqueeze(1) + coeff_y * y.unsqueeze(1) + coeff_z * z.unsqueeze(1)  # pn,sn,3
+        return directions
+
+    def sample_specular_directions(self, reflections, roughness, is_train):
+        # roughness [pn,1]
+        z = reflections  # pn,3
+        x = self.get_orthogonal_directions(reflections)  # pn,3
+        y = torch.cross(z, x, dim=-1)  # pn,3
+        a = roughness  # we assume the predicted roughness is already squared
+
+        az, el = torch.split(self.specular_direction_samples, 1, dim=1)  # sn,1
+        phi = np.pi * 2 * az  # sn,1
+        a, el = a.unsqueeze(1), el.unsqueeze(0)  # [pn,1,1] [1,sn,1]
+        cos_theta = torch.sqrt((1.0 - el + 1e-6) / (1.0 + (a ** 2 - 1.0) * el + 1e-6) + 1e-6)  # pn,sn,1
+        sin_theta = torch.sqrt(1 - cos_theta ** 2 + 1e-6)  # pn,sn,1
+
+        phi = phi.unsqueeze(0)  # 1,sn,1
+        if is_train and self.cfg['random_azimuth']:
+            phi = (phi + torch.rand(z.shape[0], 1, 1) * np.pi * 2) % (2 * np.pi)
+        coeff_x = torch.cos(phi) * sin_theta  # pn,sn,1
+        coeff_y = torch.sin(phi) * sin_theta  # pn,sn,1
+        coeff_z = cos_theta  # pn,sn,1
+
+        directions = coeff_x * x.unsqueeze(1) + coeff_y * y.unsqueeze(1) + coeff_z * z.unsqueeze(1)  # pn,sn,3
+        return directions
 
 
 class MaterialFeatsNetwork(nn.Module):

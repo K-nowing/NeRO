@@ -163,6 +163,9 @@ class NeROShapeRenderer(nn.Module):
         'occ_sdf_thresh': 0.01,
 
         "fixed_camera": False,
+        
+        # test
+        "mc_shader": False
     }
 
     def __init__(self, cfg, fp16=False, training=True):
@@ -182,8 +185,17 @@ class NeROShapeRenderer(nn.Module):
                 interpolation="smoothstep",
             )
             self.sdf_net = MLP(
-                in_dim_density + 3, 1, 64, 3, geom_init=True, weight_norm=True
+                in_dim_density + 3, 1, 32, 2, geom_init=True, weight_norm=True
             )
+            self.real_bound = self.cfg['bound']
+            # contract background
+            self.contract = True if self.real_bound > 1 else False
+            # bound for grid querying
+            if self.contract:
+                self.bound = 2
+            else:
+                self.bound = self.cfg['bound']
+            self.max_level = 16
         else:
             self.sdf_network = SDFNetwork(d_out=self.cfg['sdf_d_out'], d_in=3, d_hidden=256,
                                         n_layers=self.cfg['sdf_n_layers'],
@@ -204,7 +216,11 @@ class NeROShapeRenderer(nn.Module):
             nn.init.constant_(self.outer_nerf.rgb_linear.bias, np.log(0.5))
 
         assert self.cfg['bound'] == 1
-        self.color_network = AppShadingNetwork(self.cfg['shader_config'], 1, self.hash_encoding, self.fp16)
+        if self.cfg['mc_shader']:
+            from network.mcfield import COMShadingNetwork
+            self.color_network = COMShadingNetwork(self.cfg['shader_config'], 1, self.hash_encoding, self.fp16)
+        else:
+            self.color_network = AppShadingNetwork(self.cfg['shader_config'], 1, self.hash_encoding, self.fp16)
         
         self.raymarching = self.cfg['raymarching']
         self.update_extra_interval = self.cfg['update_extra_interval']
@@ -1025,74 +1041,79 @@ class NeROShapeRenderer(nn.Module):
         dirs = rays_d.unsqueeze(-2).expand(batch_size, n_samples, 3)
         human_poses_pt = human_poses.unsqueeze(-3).expand(batch_size, n_samples, 3, 4)
         dirs = safe_normalize(dirs, dim=-1)
+        beta_dim = self.color_network.beta_dim
         alpha, sampled_color = torch.zeros(batch_size, n_samples), torch.zeros(batch_size, n_samples, 3)
-        light_beta = torch.zeros(batch_size, n_samples, 1)
+        light_beta = torch.zeros(batch_size, n_samples, beta_dim)
 
-        if torch.sum(outer_mask) > 0:
-            if use_mask:
-                alpha[outer_mask] = torch.zeros_like(alpha[outer_mask])
-                sampled_color[outer_mask] = torch.zeros_like(sampled_color[outer_mask])
-            else:
-                alpha[outer_mask], sampled_color[outer_mask] = self.compute_density_alpha(points[outer_mask],
-                                                                                          dists[outer_mask],
-                                                                                          -dirs[outer_mask],
-                                                                                          self.outer_nerf)
+        with torch.cuda.amp.autocast(enabled=self.fp16):
+            if torch.sum(outer_mask) > 0:
+                if use_mask:
+                    alpha[outer_mask] = torch.zeros_like(alpha[outer_mask])
+                    sampled_color[outer_mask] = torch.zeros_like(sampled_color[outer_mask])
+                else:
+                    alpha[outer_mask], sampled_color[outer_mask] = self.compute_density_alpha(points[outer_mask],
+                                                                                            dists[outer_mask],
+                                                                                            -dirs[outer_mask],
+                                                                                            self.outer_nerf)
 
-        if torch.sum(inner_mask) > 0:
-            alpha[inner_mask], gradients, feature_vector, inv_s, sdf = self.compute_sdf_alpha(points[inner_mask],
-                                                                                              dists[inner_mask],
-                                                                                              dirs[inner_mask],
-                                                                                              cos_anneal_ratio, step)
-            if self.hash_encoding:
-                feature_vector = None
-            sampled_color[inner_mask], occ_info = self.color_network(points[inner_mask], gradients, -dirs[inner_mask],
-                                                                     human_poses_pt[inner_mask], feature_vector, 
-                                                                     step=step)
-            if self.use_beta:
-                light_beta[inner_mask] = occ_info['light_beta']
-            # Eikonal loss
-            gradient_error = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
-        else:
-            gradient_error = torch.zeros(1)
-
-        weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[...,
-                          :-1]  # rn,sn
-        color = (sampled_color * weights[..., None]).sum(dim=1)
-        if self.use_beta:
-            beta = (light_beta * weights[..., None]).sum(dim=1) + self.cfg['shader_config']['beta_min']
-        else:
-            beta = None
-        acc = torch.sum(weights, -1)
-        if use_mask:
-            color = color + (1. - acc[..., None]) * bg_color
-
-        outputs = {
-            'ray_rgb': color,  # rn,3
-            'ray_beta': beta,
-            'gradient_error': gradient_error,  # rn
-            'acc': acc,  # rn
-        }
-            
-
-        if torch.sum(inner_mask) > 0:
-            outputs['std'] = torch.mean(1 / inv_s)
-        else:
-            outputs['std'] = torch.zeros(1)
-
-        if step < 1000:
-            mask = torch.norm(points, dim=-1) < 1.2
-            outputs['sdf_pts'] = points[mask]
-
-        if self.cfg['apply_occ_loss']:
-            # occlusion loss
             if torch.sum(inner_mask) > 0:
-                outputs['loss_occ'] = self.compute_occ_loss(occ_info, points[inner_mask], sdf, gradients,
-                                                            dirs[inner_mask], step)
+                alpha[inner_mask], gradients, feature_vector, inv_s, sdf = self.compute_sdf_alpha(points[inner_mask],
+                                                                                                dists[inner_mask],
+                                                                                                dirs[inner_mask],
+                                                                                                cos_anneal_ratio, step)
+                if self.hash_encoding:
+                    feature_vector = None
+                sampled_color[inner_mask], occ_info = self.color_network(points[inner_mask], gradients, -dirs[inner_mask],
+                                                                        human_poses_pt[inner_mask], feature_vector, 
+                                                                        step=step)
+                if self.use_beta:
+                    light_beta[inner_mask] = occ_info['light_beta']
+                # Eikonal loss
+                gradient_error = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
             else:
-                outputs['loss_occ'] = torch.zeros(1)
+                gradient_error = torch.zeros(1)
 
-        if not is_train:
-            outputs.update(self.compute_validation_info(z_vals, rays_o, rays_d, weights, human_poses, step))
+            weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[...,
+                            :-1]  # rn,sn
+            color = (sampled_color * weights[..., None]).sum(dim=1)
+            if self.use_beta:
+                beta = (light_beta * weights[..., None]).sum(dim=1) + self.cfg['shader_config']['beta_min']
+            else:
+                beta = None
+            acc = torch.sum(weights, -1)
+            if use_mask:
+                color = color + (1. - acc[..., None]) * bg_color
+
+            outputs = {
+                'ray_rgb': color,  # rn,3
+                'ray_beta': beta,
+                'gradient_error': gradient_error,  # rn
+                'acc': acc,  # rn
+            }
+                
+
+            if torch.sum(inner_mask) > 0:
+                outputs['std'] = torch.mean(1 / inv_s)
+            else:
+                outputs['std'] = torch.zeros(1)
+
+            if step < 1000:
+                mask = torch.norm(points, dim=-1) < 1.2
+                outputs['sdf_pts'] = points[mask]
+
+            if self.cfg['apply_occ_loss']:
+                # occlusion loss
+                if torch.sum(inner_mask) > 0:
+                    if self.cfg['shader_config']['use_beta']:  # l1 reg
+                        outputs['loss_occ'] = self.cfg['lambda_occ'] * occ_info['occ_prob']
+                    else: # gt_occ supervision
+                        outputs['loss_occ'] = self.compute_occ_loss(occ_info, points[inner_mask], sdf, gradients,
+                                                                    dirs[inner_mask], step)
+                else:
+                    outputs['loss_occ'] = torch.zeros(1)
+
+            if not is_train:
+                outputs.update(self.compute_validation_info(z_vals, rays_o, rays_d, weights, human_poses, step))
 
         return outputs
     
@@ -1137,8 +1158,10 @@ class NeROShapeRenderer(nn.Module):
             )
             beta = None
             
-        if self.use_mask:
+        try:
             color = color + (1. - acc[..., None]) * bg_color
+        except:
+            import pdb;pdb.set_trace()
 
         outputs['ray_rgb'] = color
         outputs['ray_beta'] = beta
@@ -1191,7 +1214,7 @@ class NeROShapeRenderer(nn.Module):
         if self.cfg['apply_occ_loss']:
             # occlusion loss
             if torch.sum(inner_mask) > 0:
-                if occ_info['light_beta'] is not None:  # l1 reg
+                if self.cfg['shader_config']['use_beta']:  # l1 reg
                     outputs['loss_occ'] = self.cfg['lambda_occ'] * occ_info['occ_prob']
                 else: # gt_occ supervision
                     outputs['loss_occ'] = self.compute_occ_loss(occ_info, points[inner_mask], sdf, gradients,
@@ -1386,21 +1409,21 @@ class NeROMaterialRenderer(nn.Module):
         'fixed_camera': False,
     }
 
-    def __init__(self, cfg, fp16=False, is_train=True):
+    def __init__(self, cfg, fp16=False, train=True):
         self.cfg = {**self.default_cfg, **cfg}
         super().__init__()
         self.warned_normal = False
         self.is_blender = self.cfg['is_blender']
         self.use_mask = True if self.is_blender or self.cfg['use_mask'] else False
         self._init_geometry()
-        self._init_dataset(is_train)
+        self._init_dataset(train)
         self._init_shader()
 
     def _init_geometry(self):
         self.mesh = open3d.io.read_triangle_mesh(self.cfg['mesh'])
         self.ray_tracer = raytracing.RayTracer(np.asarray(self.mesh.vertices), np.asarray(self.mesh.triangles))
 
-    def _init_dataset(self, is_train):
+    def _init_dataset(self, train):
         # train/test split
         if self.cfg['database_name'].split('/')[0] == 'nerf':
             self.train_database = NeRFSyntheticDatabase(self.cfg['database_name'], self.cfg['dataset_dir'], self.cfg['img_wh'], 'train')
@@ -1412,7 +1435,7 @@ class NeROMaterialRenderer(nn.Module):
             self.test_ids = np.asarray(self.test_ids)
             self.test_ids = self.test_ids[60:61]
             
-            if is_train:
+            if train:
                 self.train_imgs_info = build_imgs_info(self.train_database, self.train_ids, self.use_mask)
                 self.train_imgs_info = imgs_info_to_torch(self.train_imgs_info, 'cpu')
                 self.train_num = len(self.train_ids)
@@ -1430,7 +1453,7 @@ class NeROMaterialRenderer(nn.Module):
             self.train_ids, self.test_ids = get_database_split(self.database, 'validation')
             self.train_ids = np.asarray(self.train_ids)
 
-            if is_train:
+            if train:
                 self.train_imgs_info = build_imgs_info(self.database, self.train_ids, self.use_mask)
                 self.train_imgs_info = imgs_info_to_torch(self.train_imgs_info, 'cpu')
                 self.train_num = len(self.train_ids)
@@ -1505,6 +1528,8 @@ class NeROMaterialRenderer(nn.Module):
 
     def _construct_ray_batch(self, imgs_info, device='cpu', is_train=True):
         imn, _, h, w = imgs_info['imgs'].shape
+        imgs_info['imgs'] = imgs_info['imgs'][:,:3]
+        
         coords = torch.stack(torch.meshgrid(torch.arange(h), torch.arange(w)), -1)[:, :, (1, 0)]  # h,w,2
         coords = coords.to('cpu')
         coords = coords.float()[None, :, :, :].repeat(imn, 1, 1, 1)  # imn,h,w,2
