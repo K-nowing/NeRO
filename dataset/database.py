@@ -445,7 +445,13 @@ class NeRFSyntheticDatabase(BaseDatabase):
             frame_list = self.meta['frames'] if 'train' else self.meta['frames'][:val_num]
             for frame in frame_list:
                 fname = os.path.join(self.root, frame['file_path'] + '.png')
-                imgs.append(imageio.imread(fname))
+                img = imageio.imread(fname)
+                if img.shape[-1] != 4:
+                    # ball in ShinyBlender
+                    a_fname = os.path.join(self.root, frame['file_path'] + '_alpha.png')
+                    alpha = imageio.imread(a_fname)
+                    img = np.concatenate([img, alpha[..., None]], -1)
+                imgs.append(img)
                 poses.append(np.array(frame['transform_matrix']))
             self.imgs = np.array(imgs)  # keep all 4 channels (RGBA)
             self.poses = np.array(poses).astype(np.float32)

@@ -7,4 +7,5 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--cfg', type=str)
 flags = parser.parse_args()
 
-Trainer(load_cfg(flags.cfg)).test()
+trainer = Trainer(load_cfg(flags.cfg))
+trainer.test()

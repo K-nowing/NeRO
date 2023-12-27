@@ -643,12 +643,13 @@ class COMShadingNetwork(nn.Module):
         'nero_ide': True,
         'use_beta': False,
         'beta_min': 0.2,
+        'beta_dim': 1,
         
         ## mcshading
-        'diffuse_sample_num': 256,
-        'specular_sample_num': 128,
-        # 'diffuse_sample_num': 512,
-        # 'specular_sample_num': 256,
+        # 'diffuse_sample_num': 256,
+        # 'specular_sample_num': 128,
+        'diffuse_sample_num': 512,
+        'specular_sample_num': 256,
         'human_lights': True,
         'light_exp_max': 5.0,
         'inner_light_exp_max': 5.0,
@@ -677,6 +678,7 @@ class COMShadingNetwork(nn.Module):
         self.cfg = {**self.default_cfg, **cfg}
         self.hash_encoding = hash_encoding
         self.fp16 = fp16
+        self.beta_dim = self.cfg['beta_dim']
 
         # material MLPs
         if self.hash_encoding:
@@ -764,7 +766,8 @@ class COMShadingNetwork(nn.Module):
             mipbias_lr=1e-4,
             mipnoise=0.0,
         )
-        indirect_bg_module = -1.897 * torch.ones((1, 512, 1024, 16))
+        # indirect_bg_module = -1.897 * torch.ones((1, 512, 1024, 16))
+        indirect_bg_module = torch.rand((1, 512, 1024, 16))
         self.register_parameter('indirect_bg_module', nn.Parameter(indirect_bg_module))
         self.outer_light = None
             
@@ -843,7 +846,7 @@ class COMShadingNetwork(nn.Module):
                 
             if self.cfg['direct_light'] and self.cfg['indirect_light']:
                 ref_ = self.dir_enc(reflective)
-                with torch.cuda.amp.autocast(enabled=self.fp16):
+                with torch.cuda.amp.autocast(enabled=False):
                     occ_prob = self.inner_weight(torch.cat([pts.detach(), ref_.detach()], -1))  # this is occlusion prob
                     occ_prob = occ_prob * 0.5 + 0.5
                     occ_prob_ = torch.clamp(occ_prob, min=0, max=1)
@@ -883,72 +886,86 @@ class COMShadingNetwork(nn.Module):
         reflective = torch.sum(o_dirs * normals, -1, keepdim=True) * normals * 2 - o_dirs
         NoV = torch.sum(normals * o_dirs, -1, keepdim=True)
 
-        with torch.cuda.amp.autocast(enabled=self.fp16):
-            if self.hash_encoding:
-                albedo, metallic, roughness, p_feat = self.predict_materials(points, return_feat=True)
-            else:
-                albedo, metallic, roughness, p_feat = self.predict_materials(points, feature_vectors, return_feat=True)
+        if self.hash_encoding:
+            albedo, metallic, roughness, p_feat = self.predict_materials(points, return_feat=True)
+        else:
+            albedo, metallic, roughness, p_feat = self.predict_materials(points, feature_vectors, return_feat=True)
         F0 = 0.04 * (1 - metallic) + metallic * albedo  # [pn,1]
         
-        with torch.cuda.amp.autocast(enabled=self.fp16):
-            # diffuse light
-            diffuse_directions = self.sample_diffuse_directions(normals, is_train)  # [pn,sn0,3]
-            point_num, diffuse_num, _ = diffuse_directions.shape
-            # sample specular directions
-            specular_directions = self.sample_specular_directions(reflective, roughness, is_train)  # [pn,sn1,3]
-            specular_num = specular_directions.shape[1]
+        # diffuse light
+        diffuse_directions = self.sample_diffuse_directions(normals, is_train)  # [pn,sn0,3]
+        point_num, diffuse_num, _ = diffuse_directions.shape
+        # sample specular directions
+        specular_directions = self.sample_specular_directions(reflective, roughness, is_train)  # [pn,sn1,3]
+        specular_num = specular_directions.shape[1]
 
-            # diffuse sample prob
-            NoL_d = saturate_dot(diffuse_directions, normals.unsqueeze(1))
-            diffuse_probability = NoL_d / np.pi * (diffuse_num / (specular_num + diffuse_num))
+        # diffuse sample prob
+        NoL_d = saturate_dot(diffuse_directions, normals.unsqueeze(1))
+        diffuse_probability = NoL_d / np.pi * (diffuse_num / (specular_num + diffuse_num))
 
-            # specualr sample prob
-            H_s = (o_dirs.unsqueeze(1) + specular_directions)  # [pn,sn0,3] half vector
-            H_s = safe_normalize(H_s, dim=-1)
-            NoH_s = saturate_dot(normals.unsqueeze(1), H_s)
-            VoH_s = saturate_dot(o_dirs.unsqueeze(1), H_s)
-            specular_probability = self.distribution_ggx(NoH_s, roughness.unsqueeze(1)) * NoH_s / (4 * VoH_s + 1e-5) * (
-                        specular_num / (specular_num + diffuse_num))  # D * NoH / (4 * VoH)
+        # specualr sample prob
+        H_s = (o_dirs.unsqueeze(1) + specular_directions)  # [pn,sn0,3] half vector
+        H_s = safe_normalize(H_s, dim=-1)
+        NoH_s = saturate_dot(normals.unsqueeze(1), H_s)
+        VoH_s = saturate_dot(o_dirs.unsqueeze(1), H_s)
+        specular_probability = self.distribution_ggx(NoH_s, roughness.unsqueeze(1)) * NoH_s / (4 * VoH_s + 1e-5) * (
+                    specular_num / (specular_num + diffuse_num))  # D * NoH / (4 * VoH)
 
-            # combine
-            directions = torch.cat([diffuse_directions, specular_directions], 1)
-            probability = torch.cat([diffuse_probability, specular_probability], 1)
-            sn = diffuse_num + specular_num
+        # combine
+        directions = torch.cat([diffuse_directions, specular_directions], 1)
+        probability = torch.cat([diffuse_probability, specular_probability], 1)
+        sn = diffuse_num + specular_num
 
-            # specular
-            fresnel, H, HoV = self.fresnel_schlick_directions(F0.unsqueeze(1), o_dirs.unsqueeze(1), directions)
-            NoV = saturate_dot(normals, o_dirs).unsqueeze(1)  # pn,1,3
-            NoL = saturate_dot(normals.unsqueeze(1), directions)  # pn,sn,3
-            geometry = self.geometry(NoV, NoL, roughness.unsqueeze(1))
-            NoH = saturate_dot(normals.unsqueeze(1), H)
-            distribution = self.distribution_ggx(NoH, roughness.unsqueeze(1))
-            human_poses = human_poses.unsqueeze(1).repeat(1, sn, 1, 1) if human_poses is not None else None
-            pts_ = points.unsqueeze(1).repeat(1, sn, 1)
-            light_point_feat = self.indirect_point_encoder(p_feat)
-            light_point_feat = light_point_feat.unsqueeze(1).repeat(1, sn, 1)  # pn,sn,64*5
-            # lights, hl, light_pts, light_normals, light_pts_mask = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
-            # lights = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
-            # lights = self.get_lights(pts_, directions, human_poses, roughness)  # pn,sn,3
+        # specular
+        fresnel, H, HoV = self.fresnel_schlick_directions(F0.unsqueeze(1), o_dirs.unsqueeze(1), directions)
+        NoV = saturate_dot(normals, o_dirs).unsqueeze(1)  # pn,1,3
+        NoL = saturate_dot(normals.unsqueeze(1), directions)  # pn,sn,3
+        geometry = self.geometry(NoV, NoL, roughness.unsqueeze(1))
+        NoH = saturate_dot(normals.unsqueeze(1), H)
+        distribution = self.distribution_ggx(NoH, roughness.unsqueeze(1))
+        human_poses = human_poses.unsqueeze(1).repeat(1, sn, 1, 1) if human_poses is not None else None
+        pts_ = points.unsqueeze(1).repeat(1, sn, 1)
+        light_point_feat = self.indirect_point_encoder(p_feat)
+        light_point_feat = light_point_feat.unsqueeze(1).repeat(1, sn, 1)  # pn,sn,64*5
+        # lights, hl, light_pts, light_normals, light_pts_mask = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
+        # lights = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
+        lights = self.get_lights(pts_, directions, human_poses, roughness)  # pn,sn,3
 
-            
-            outer_lights, inner_light, alpha, beta = self.get_lights(pts_, directions, human_poses, roughness, light_point_feat)  # pn,sn,3
-            lights = outer_lights * (1-alpha.unsqueeze(-1)) + inner_light * alpha.unsqueeze(-1)
-            
-
-            
-            specular_weights = distribution * geometry / (4 * NoV * probability + 1e-5)
-            specular_lights = lights * specular_weights
-            specular_colors = torch.mean(fresnel * specular_lights, 1)
-            specular_weights = specular_weights * fresnel
+        # outer_lights, inner_light, alpha, beta = self.get_lights(pts_, directions, human_poses, roughness, light_point_feat, step)  # pn,sn,3
+        # lights = outer_lights * (1-alpha.unsqueeze(-1)) + inner_light * alpha.unsqueeze(-1)
         
-            occ_prob = torch.mean(alpha.unsqueeze(-1) * specular_weights, 1) ## check
-            light_beta = torch.mean(beta.unsqueeze(-1) * specular_weights, 1)
+
+        
+        specular_weights_ = distribution * geometry / (4 * NoV * probability + 1e-5)
+        specular_lights = lights * specular_weights_
+        specular_colors = torch.mean(fresnel * specular_lights, 1)
+        
+        
+
+
+        specular_weights = specular_weights_ * fresnel
 
         # diffuse only consider diffuse directions
         kd = (1 - metallic.unsqueeze(1))
         diffuse_lights = lights[:, :diffuse_num]
         diffuse_colors = albedo.unsqueeze(1) * kd[:, :diffuse_num] * diffuse_lights
         diffuse_colors = torch.mean(diffuse_colors, 1)
+        
+
+        # # occ_prob = torch.mean(alpha.unsqueeze(-1) * specular_weights, 1) ## check
+        # # light_beta = torch.mean(beta.unsqueeze(-1) * specular_weights, 1)        
+        # # occ_prob = torch.mean(alpha.unsqueeze(-1) * specular_weights_ * metallic.detach().unsqueeze(1) + 0.04 * (1 - metallic.detach().unsqueeze(1)), 1) ## check
+        # # light_beta = torch.mean(beta.unsqueeze(-1) * specular_weights_ * metallic.detach().unsqueeze(1) + 0.04 * (1 - metallic.detach().unsqueeze(1)), 1)
+        # occ_prob = torch.mean(alpha.unsqueeze(-1) * specular_weights_ * metallic.unsqueeze(1), 1) ## check
+        # light_beta = torch.mean(beta.unsqueeze(-1) * specular_weights_ * metallic.unsqueeze(1), 1)
+        # # occ_prob = torch.mean(alpha.unsqueeze(-1) * specular_weights_ * metallic.detach().unsqueeze(1), 1) ## check
+        # # light_beta = torch.mean(beta.unsqueeze(-1) * specular_weights_ * metallic.detach().unsqueeze(1), 1)
+        # diffuse_occ_prob = torch.mean(alpha[:, :diffuse_num].unsqueeze(-1) * kd[:, :diffuse_num], 1)
+        # diffuse_light_beta = torch.mean(beta[:, :diffuse_num].unsqueeze(-1) * kd[:, :diffuse_num], 1)
+        # # diffuse_occ_prob = torch.mean(alpha[:, :diffuse_num].unsqueeze(-1) * kd.detach()[:, :diffuse_num], 1)
+        # # diffuse_light_beta = torch.mean(beta[:, :diffuse_num].unsqueeze(-1) * kd.detach()[:, :diffuse_num], 1)
+        # occ_prob += diffuse_occ_prob
+        # light_beta += diffuse_light_beta
 
         colors = diffuse_colors + specular_colors
         colors = linear_to_srgb(colors)
@@ -987,8 +1004,10 @@ class COMShadingNetwork(nn.Module):
 
         outputs = {
             'reflective': reflective,
-            'occ_prob': occ_prob,
-            'light_beta': light_beta, 
+            # 'occ_prob': occ_prob,
+            # 'light_beta': light_beta, 
+            'occ_prob': None,
+            'light_beta': None, 
         }
         if inter_results:
             empty = torch.zeros_like(F0)
@@ -1025,7 +1044,7 @@ class COMShadingNetwork(nn.Module):
             linear_to_srgb(torch.mean(kd[:, :diffuse_num] * diffuse_lights, dim=1) + specular_colors), min=0, max=1)
         return colors, outputs,
 
-    def get_lights(self, pts_, directions, human_poses, roughness, light_point_feat):
+    def get_lights(self, pts_, directions, human_poses, roughness):#, light_point_feat, step):
         # d_shape = directions.shape
         # a, b, c = directions[..., 0:1], directions[..., 1:2], directions[..., 2:3]
         # norm2d = torch.sqrt(a**2 + b**2)
@@ -1046,32 +1065,32 @@ class COMShadingNetwork(nn.Module):
         outer_lights = self.bg_module(directions, roughness)
         outer_lights = outer_lights.view(shape)
         
-        if self.indirect_bg_module is not None:
-            a, b, c = directions[..., 0:1], directions[..., 1:2], directions[..., 2:3]
-            norm2d = torch.sqrt(a**2 + b**2)
-            phi = safemath.atan2(b, a)
-            theta = safemath.atan2(c, norm2d)
-            coords = torch.cat([(phi % (2 * math.pi) - math.pi) / math.pi,-theta / math.pi * 2,],dim=1,)
-            x = coords.reshape(1, 1, -1, 2)
-            x = (x + 1) / 2  # [-1,1] -> [0,1]
+        # if self.indirect_bg_module is not None:
+        #     a, b, c = directions[..., 0:1], directions[..., 1:2], directions[..., 2:3]
+        #     norm2d = torch.sqrt(a**2 + b**2)
+        #     phi = safemath.atan2(b, a)
+        #     theta = safemath.atan2(c, norm2d)
+        #     coords = torch.cat([(phi % (2 * math.pi) - math.pi) / math.pi,-theta / math.pi * 2,],dim=1,)
+        #     x = coords.reshape(1, 1, -1, 2)
+        #     x = (x + 1) / 2  # [-1,1] -> [0,1]
             
-            id_feature = dr.texture(self.indirect_bg_module, x.contiguous(), filter_mode='linear',
-                        boundary_mode='clamp').reshape(-1, 16)
+        #     id_feature = dr.texture(self.indirect_bg_module, x.contiguous(), filter_mode='linear',
+        #                 boundary_mode='clamp').reshape(-1, 16)
             
-            # point_feature = self.indirect_emb_net(xyz_)
-            # point_feature = point_feature.view(-1, 64, 5)
-            light_point_feat = light_point_feat.view(-1, 16, 5)
+        #     # point_feature = self.indirect_emb_net(xyz_)
+        #     # point_feature = point_feature.view(-1, 16, 5)
+        #     light_point_feat = light_point_feat.view(-1, 16, 5)
             
-            inner_light_alpha_beta = (id_feature.unsqueeze(-1) * light_point_feat).sum(-2)
-            inner_lights = torch.exp(inner_light_alpha_beta[..., :3].clamp(max=20.))
-            alpha = torch.sigmoid(inner_light_alpha_beta[..., 3])
-            beta = alpha * F.softplus(inner_light_alpha_beta[..., 4])
+        #     inner_light_alpha_beta = (id_feature.unsqueeze(-1) * light_point_feat).sum(-2)
+        #     inner_light = torch.exp(inner_light_alpha_beta[..., :3].clamp(max=20.))
+        #     alpha = torch.sigmoid(inner_light_alpha_beta[..., 3])
+        #     beta = alpha * F.softplus(inner_light_alpha_beta[..., 4])
             
-            inner_lights = inner_lights.view(shape)
-            alpha = alpha.view(shape[:-1])
-            beta = beta.view(shape[:-1])
+        #     inner_light = inner_light.view(shape)
+        #     alpha = alpha.view(shape[:-1])
+        #     beta = beta.view(shape[:-1])
             
-        return outer_lights, inner_lights, alpha, beta
+        return outer_lights#, inner_light, alpha, beta
         
     def predict_materials(self, points, features=None, return_feat=False):
         if self.hash_encoding:

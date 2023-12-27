@@ -17,13 +17,11 @@ class ValidationEvaluator:
         self.key_metric_name = cfg['key_metric_name']
         self.key_metric = name2key_metrics[self.key_metric_name]
 
-    def __call__(self, model, losses, eval_dataset, step, model_name, val_set_name=None):
-        if val_set_name is not None: model_name = f'{model_name}-{val_set_name}'
+    def __call__(self, model, losses, metrics, eval_dataset, step, val_set_name=None):
         model.eval()
         eval_results = {}
         begin = time.time()
-        outputs_dict = defaultdict(list)
-        
+        result_image_dict = dict()
         for data_i, data in enumerate(tqdm(eval_dataset)):
             data = to_cuda(data)
             data['eval'] = True
@@ -32,7 +30,7 @@ class ValidationEvaluator:
                 outputs = model(data)
 
             for loss in losses:
-                loss_results = loss(outputs, data, step, data_index=data_i, model_name=model_name)
+                loss_results = loss(outputs, data, step, data_index=data_i)
                 for k, v in loss_results.items():
                     if type(v) == torch.Tensor:
                         v = v.detach().cpu().numpy()
@@ -41,9 +39,18 @@ class ValidationEvaluator:
                         eval_results[k].append(v)
                     else:
                         eval_results[k] = [v]
+            metric_results, result_image = metrics(outputs, data, step, data_index=data_i)
+            for k, v in metric_results.items():
+                if type(v) == torch.Tensor:
+                    v = v.detach().cpu().numpy()
+                if k in eval_results:
+                    eval_results[k].append(v)
+                else:
+                    eval_results[k] = [v]
+            result_image_dict[data_i] = result_image
 
         for k, v in eval_results.items():
-            eval_results[k] = np.concatenate(v, axis=0)
+            eval_results[k] = np.concatenate(v, axis=0).mean().item()
 
         # evaluate poses
         # with torch.no_grad():
@@ -53,4 +60,4 @@ class ValidationEvaluator:
         eval_results[self.key_metric_name] = key_metric_val
         print('eval cost {} s'.format(time.time() - begin))
         torch.cuda.empty_cache()
-        return eval_results, key_metric_val
+        return eval_results, key_metric_val, result_image_dict

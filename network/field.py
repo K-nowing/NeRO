@@ -80,7 +80,6 @@ class SDFNetwork(nn.Module):
                  geometric_init=True,
                  weight_norm=True,
                  inside_outside=False,
-                 sdf_activation='none',
                  layer_activation='softplus'):
         super(SDFNetwork, self).__init__()
 
@@ -232,16 +231,18 @@ class GridVarianceNetwork(nn.Module):
         cube_weights = (cube_offset[:, :, 0] * cube_offset[:, :, 1] * cube_offset[:, :, 2])  # [n,8]
         cube_variances = self.variance[cube_coords[:, :, 0], cube_coords[:, :, 1], cube_coords[:, :, 2]]
         
-        variances = (cube_weights * cube_variances).sum(-1)
+        # variances = (cube_weights * cube_variances).sum(-1)
         
-        if self.act == 'exp':
-            return torch.exp(variances * 10.0)
-        elif self.act == 'linear':
-            return variances * 10.0
-        elif self.act == 'square':
-            return (variances * 10.0) ** 2
-        else:
-            raise NotImplementedError
+        # if self.act == 'exp':
+        #     return torch.exp(variances * 10.0)
+        # elif self.act == 'linear':
+        #     return variances * 10.0
+        # elif self.act == 'square':
+        #     return (variances * 10.0) ** 2
+        # else:
+        #     raise NotImplementedError
+        
+        return (cube_weights * torch.exp(cube_variances* 10.0)).sum(-1)
 
 
 # This implementation is borrowed from nerf-pytorch: https://github.com/yenchenlin/nerf-pytorch
@@ -439,6 +440,67 @@ class LightNetwork(nn.Module):
         indirect_beta = indirect_alpha * indirect_beta
         
         return indirect_light, indirect_alpha, indirect_beta
+    
+class MaterialNetwork(nn.Module):
+    def __init__(self,
+                 input_dim, 
+                 D=4,
+                 W=256,
+                 d_in_view=3,
+                 multires=0,
+                 multires_view=0,
+                 output_ch=4,
+                 skips=[4],
+                 weight_norm = True,
+                 exp_max = 5, 
+                 use_viewdirs=False,
+                 beta_dim=1,
+                 use_plucker=False):
+        super(MaterialNetwork, self).__init__()
+        self.use_plucker = use_plucker
+        self.encoding = nn.Sequential(
+            nn.utils.weight_norm(nn.Linear(input_dim, W)),
+            nn.ReLU(True),
+            nn.utils.weight_norm(nn.Linear(W, W)),
+            nn.ReLU(True),
+            nn.utils.weight_norm(nn.Linear(W, W)),
+            nn.ReLU(True),
+            nn.utils.weight_norm(nn.Linear(W, W)),
+            nn.ReLU(True),
+        )
+        self.albedo = nn.Sequential(
+            nn.utils.weight_norm(nn.Linear(W + input_dim, W//2)),
+            nn.ReLU(True),
+            nn.utils.weight_norm(nn.Linear(W//2 , W//2 )),
+            nn.ReLU(True),
+            nn.utils.weight_norm(nn.Linear(W//2 , 3)),
+            nn.Sigmoid()
+        )
+        self.metallic = nn.Sequential(
+            nn.utils.weight_norm(nn.Linear(W + input_dim, W//2)),
+            nn.ReLU(True),
+            nn.utils.weight_norm(nn.Linear(W//2 , W//2 )),
+            nn.ReLU(True),
+            nn.utils.weight_norm(nn.Linear(W//2 , 1)),
+            nn.Sigmoid()
+        )
+        self.roughness = nn.Sequential(
+            nn.utils.weight_norm(nn.Linear(W + input_dim, W//2)),
+            nn.ReLU(True),
+            nn.utils.weight_norm(nn.Linear(W//2 , W//2 )),
+            nn.ReLU(True),
+            nn.utils.weight_norm(nn.Linear(W//2 , 1)),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        h = self.encoding(x)
+        h = torch.cat([h, x], -1)
+        albedo = self.albedo(h)
+        metallic = self.metallic(h)
+        roughness = self.roughness(h)
+        
+        return albedo, metallic, roughness
 
 
 def make_predictor(inputs_dim: int, output_dim: int, hidden_dim: int, layer_num: int, weight_norm: bool = True, last_activation: str = 'sigmoid',
@@ -451,6 +513,8 @@ def make_predictor(inputs_dim: int, output_dim: int, hidden_dim: int, layer_num:
         last_activation = IdentityActivation()
     elif last_activation == 'relu':
         last_activation = nn.ReLU(True)
+    elif last_activation == 'relu':
+        last_activation = nn.Softplus()
     else:
         raise NotImplementedError
 
@@ -651,7 +715,6 @@ class AppShadingNetwork(nn.Module):
         'indirect_light': True,
         'nero_ide': True,
         'use_beta': False,
-        'beta_min': 0.2,
         
         'use_plucker': False,
         'beta_dim': 1,
@@ -667,19 +730,22 @@ class AppShadingNetwork(nn.Module):
         if self.hash_encoding:
             self.bound = bound
             self.max_level = 16
-            self.encoder_material, in_dim_material = get_encoder(
-                "hashgrid_tcnn" if True else "hashgrid",
-                level_dim=2,
-                desired_resolution=2048 * self.bound,
-                interpolation="smoothstep",
-            )
-            self.albedo_predictor = make_predictor(in_dim_material + 3, 3, 64, 3)
-            self.metallic_predictor = make_predictor(in_dim_material + 3, 1, 64, 3)
-            if self.cfg['metallic_init'] != 0:
-                nn.init.constant_(self.metallic_predictor[-2].bias, self.cfg['metallic_init'])
-            self.roughness_predictor = make_predictor(in_dim_material + 3, 1, 64, 3)
-            if self.cfg['roughness_init'] != 0:
-                nn.init.constant_(self.roughness_predictor[-2].bias, self.cfg['roughness_init'])
+            # self.encoder_material, in_dim_material = get_encoder(
+            #     "hashgrid_tcnn" if True else "hashgrid",
+            #     level_dim=2,
+            #     desired_resolution=2048 * self.bound,
+            #     interpolation="smoothstep",
+            # )
+            # self.albedo_predictor = make_predictor(in_dim_material + 3, 3, 64, 3)
+            # self.metallic_predictor = make_predictor(in_dim_material + 3, 1, 64, 3)
+            # if self.cfg['metallic_init'] != 0:
+            #     nn.init.constant_(self.metallic_predictor[-2].bias, self.cfg['metallic_init'])
+            # self.roughness_predictor = make_predictor(in_dim_material + 3, 1, 64, 3)
+            # if self.cfg['roughness_init'] != 0:
+            #     nn.init.constant_(self.roughness_predictor[-2].bias, self.cfg['roughness_init'])
+                
+            self.pos_enc, pos_dim = get_embedder(self.cfg['light_pos_freq'], 3)
+            self.material_net = MaterialNetwork(pos_dim)
         else:
             feats_dim = 256
             self.albedo_predictor = make_predictor(feats_dim + 3, 3, 256, 4)
@@ -689,6 +755,11 @@ class AppShadingNetwork(nn.Module):
             self.roughness_predictor = make_predictor(feats_dim + 3, 1, 256, 4)
             if self.cfg['roughness_init'] != 0:
                 nn.init.constant_(self.roughness_predictor[-2].bias, self.cfg['roughness_init'])
+            if self.cfg['use_color_beta']:
+                _, dir_dim = get_embedder(6, 3)
+                self.indirect_color_predictor = make_predictor(feats_dim + 3 + dir_dim, 5, 256, 4, last_activation='none')
+                # self.indirect_alpha_predictor = make_predictor(feats_dim + 3 + dir_dim, 1, 256, 4, last_activation='sigmoid')
+                # self.indirect_beta_predictor = make_predictor(feats_dim + 3 + dir_dim, 1, 256, 4, last_activation='softplus')
         
         if self.cfg['use_fglu']:
             FG_LUT = torch.from_numpy(np.fromfile('assets/bsdf_256_256.bin', dtype=np.float32).reshape(1, 256, 256, 2))
@@ -703,10 +774,10 @@ class AppShadingNetwork(nn.Module):
         self.pos_enc, pos_dim = get_embedder(self.cfg['light_pos_freq'], 3)
         exp_max = self.cfg['light_exp_max']
         # outer lights are direct lights
+        self.beta_dim = self.cfg['beta_dim']
         if self.cfg['use_beta']:
             # self.light_network = LightNetwork(sph_dim, pos_dim)
             # exp_max = 5.0
-            self.beta_dim = self.cfg['beta_dim']
             if self.cfg['use_fglu']:
                 self.light_network = LightNetwork(sph_dim, pos_dim, exp_max=0.0, use_plucker=self.cfg['use_plucker'], beta_dim=self.beta_dim)
             else:
@@ -714,7 +785,6 @@ class AppShadingNetwork(nn.Module):
             nn.init.constant_(self.light_network.indirect_light[-2].bias, np.log(0.5))
             nn.init.constant_(self.light_network.direct_light[-2].bias, np.log(0.5))
             nn.init.constant_(self.light_network.indirect_alpha[-1].bias, self.cfg['inner_init'])
-                
         else:
             if self.cfg['sphere_direction']:
                 self.outer_light = make_predictor(sph_dim * 2, 3, 256, 4, last_activation='exp', exp_max=exp_max)
@@ -723,11 +793,8 @@ class AppShadingNetwork(nn.Module):
             nn.init.constant_(self.outer_light[-2].bias, np.log(0.5))
 
             # inner lights are indirect lights
-            if self.cfg['use_beta']:
-                self.inner_light = make_predictor(pos_dim + sph_dim, 4, 256, 4, last_activation='none')
-            else:
-                self.inner_light = make_predictor(pos_dim + sph_dim, 3, 256, 4, last_activation='exp', exp_max=exp_max)
-                nn.init.constant_(self.inner_light[-2].bias, np.log(0.5))
+            self.inner_light = make_predictor(pos_dim + sph_dim, 3, 256, 4, last_activation='exp', exp_max=exp_max)
+            nn.init.constant_(self.inner_light[-2].bias, np.log(0.5))
 
             self.inner_weight = make_predictor(pos_dim + dir_dim, 1, 256, 4, last_activation='none')
             nn.init.constant_(self.inner_weight[-2].bias, self.cfg['inner_init'])
@@ -766,20 +833,31 @@ class AppShadingNetwork(nn.Module):
         
         ref_roughness = self.sph_enc(reflective, roughness)
         human_light, human_weight = 0, 0
-        if self.cfg['use_beta']:
-            
+        if self.cfg['use_beta']:                
             if self.cfg['use_plucker']:
                 pts_enc = self.pos_enc(cross)
                 direct_light, indirect_light, occ_prob, light_beta = self.light_network(ref_roughness, pts_enc, plucker_scale)
             else:
                 pts_enc = self.pos_enc(points)
                 direct_light, indirect_light, occ_prob, light_beta = self.light_network(ref_roughness, pts_enc)
-            occ_prob = occ_prob * 0.5 + 0.5
-            occ_prob = torch.clamp(occ_prob, min=0, max=1)
+            # occ_prob = occ_prob * 0.5 + 0.5
+            # occ_prob = torch.clamp(occ_prob, min=0, max=1)
+            
+            occ_prob = torch.sigmoid(occ_prob)
             light_beta = occ_prob*light_beta
-            light = indirect_light * occ_prob + (human_light * human_weight + direct_light * (1 - human_weight)) * (
-                            1 - occ_prob)
-            indirect_light = indirect_light * occ_prob
+            if self.cfg['use_color_beta']:
+                light = direct_light
+            else:
+                light = indirect_light * occ_prob + (human_light * human_weight + direct_light * (1 - human_weight)) * (
+                                1 - occ_prob)
+                indirect_light = indirect_light * occ_prob
+            
+            # occ_prob = torch.sigmoid(occ_prob) * 2 - 1
+            # occ_prob_ = torch.abs(occ_prob)
+            # light_beta = occ_prob_*light_beta
+            # light = indirect_light * occ_prob + (human_light * human_weight + direct_light * (1 - human_weight)) * (
+            #                 1)
+            # indirect_light = indirect_light * occ_prob
         else:
             light_beta = None
             if self.cfg['human_light']:
@@ -843,14 +921,16 @@ class AppShadingNetwork(nn.Module):
         reflective = torch.sum(o_dirs * normals, -1, keepdim=True) * normals * 2 - o_dirs
         NoV = torch.sum(normals * o_dirs, -1, keepdim=True)
 
-        if self.hash_encoding:
-            albedo, metallic, roughness = self.predict_materials(points)
+        if self.cfg['use_color_beta']:
+            if self.hash_encoding:
+                albedo, metallic, roughness, indirect_color, alpha, beta = self.predict_materials(points, reflective=reflective)
+            else:
+                albedo, metallic, roughness, indirect_color, alpha, beta = self.predict_materials(points, features=feature_vectors, reflective=reflective)
         else:
-            albedo, metallic, roughness = self.predict_materials(points, feature_vectors)
-        # diffuse light
-        diffuse_light = self.predict_diffuse_lights(points, normals)
-        diffuse_albedo = (1 - metallic) * albedo
-        diffuse_color = diffuse_albedo * diffuse_light
+            if self.hash_encoding:
+                albedo, metallic, roughness = self.predict_materials(points)
+            else:
+                albedo, metallic, roughness = self.predict_materials(points, feature_vectors)
 
         # specular light
         specular_albedo = 0.04 * (1 - metallic) + metallic * albedo
@@ -868,6 +948,23 @@ class AppShadingNetwork(nn.Module):
         else:
             specular_ref = specular_albedo
         specular_color = specular_ref * specular_light
+        
+        # diffuse light
+        if self.cfg['use_beta']:
+            one_roughness = torch.ones([normals.shape[0], 1])
+            diffuse_light, d_occ_prob, d_indirect_light, _, d_light_beta = self.predict_specular_lights(points,
+                                                                                                normals, one_roughness,
+                                                                                                human_poses, step)
+            indirect_light += d_indirect_light
+            occ_prob = occ_prob * metallic.detach() + d_occ_prob * (1 - metallic.detach())
+            light_beta = light_beta * metallic.detach() + d_light_beta * (1 - metallic.detach())
+            # occ_prob = occ_prob * (0.04 + 0.96 * metallic.detach()) + d_occ_prob * (1 - metallic.detach())
+            # light_beta = light_beta * (0.04 + 0.96 * metallic.detach()) + d_light_beta * (1 - metallic.detach())
+
+        else:
+            diffuse_light = self.predict_diffuse_lights(points, normals)
+        diffuse_albedo = (1 - metallic) * albedo
+        diffuse_color = diffuse_albedo * diffuse_light
 
         # integrated together
         color = diffuse_color + specular_color
@@ -876,6 +973,10 @@ class AppShadingNetwork(nn.Module):
         diffuse_color = linear_to_srgb(diffuse_color)
         specular_color = linear_to_srgb(specular_color)
         color = linear_to_srgb(color)
+        if self.cfg['use_color_beta']:
+            color = color + alpha * indirect_color 
+            occ_prob = torch.abs(alpha)
+            light_beta = beta * occ_prob
         color = torch.clamp(color, min=0.0, max=1.0)
 
         occ_info = {
@@ -908,15 +1009,23 @@ class AppShadingNetwork(nn.Module):
             return color, occ_info,
 
 
-    def predict_materials(self, points, features=None):
+    def predict_materials(self, points, features=None, reflective=None):
         if self.hash_encoding:
-            h = self.encoder_material(points, bound=self.bound, max_level=self.max_level)
-            h = torch.cat([points, h], dim=-1)
+            # h = self.encoder_material(points, bound=self.bound, max_level=self.max_level)
+            # h = torch.cat([points, h], dim=-1)
+            return self.material_net(self.pos_enc(points))
         else:
             h = torch.cat([points, features], dim=-1)
         albedo = self.albedo_predictor(h)
         metallic = self.metallic_predictor(h)
         roughness = self.roughness_predictor(h)
+        if reflective is not None:
+            h = torch.cat([h, self.dir_enc(reflective)], dim=-1)
+            indirect = self.indirect_color_predictor(h)
+            indirect_color = torch.sigmoid(indirect[..., :3])
+            indirect_alpha = torch.sigmoid(indirect[..., 3:4]) * 2 - 1
+            indirect_beta = torch.nn.functional.softplus(indirect[..., 4:5])
+            return albedo, metallic, roughness, indirect_color, indirect_alpha, indirect_beta
         return albedo, metallic, roughness
 
 
@@ -981,6 +1090,9 @@ class MCShadingNetwork(nn.Module):
         'equirect_env_light': False,
         'env_map': False,
         'feature_size': 0,
+        
+        'use_plucker': False,
+        'use_beta': False,
     }
 
     def __init__(self, cfg, ray_trace_fun):
@@ -995,6 +1107,7 @@ class MCShadingNetwork(nn.Module):
 
         # light part
         self.sph_enc = generate_ide_fn(5)
+        sph_dim = 72
         self.dir_enc, dir_dim = get_embedder(6, 3)
         self.pos_enc, pos_dim = get_embedder(8, 3)
         if self.cfg['equirect_env_light']:
@@ -1026,13 +1139,20 @@ class MCShadingNetwork(nn.Module):
             
         else:
             self.bg_module = None
-            if self.cfg['outer_light_version'] == 'direction':
-                self.outer_light = make_predictor(72, 3, 256, 4, last_activation='exp', exp_max=self.cfg['light_exp_max'])
-            elif self.cfg['outer_light_version'] == 'sphere_direction':
-                self.outer_light = make_predictor(72 * 2, 3, 256, 4, last_activation='exp', exp_max=self.cfg['light_exp_max'])
+            
+            if self.cfg['use_beta']:
+                self.light_network = LightNetwork(sph_dim, pos_dim, exp_max=5.0, use_plucker=self.cfg['use_plucker'], beta_dim=1)
+                nn.init.constant_(self.light_network.indirect_light[-2].bias, np.log(0.5))
+                nn.init.constant_(self.light_network.direct_light[-2].bias, np.log(0.5))
+                # nn.init.constant_(self.light_network.indirect_alpha[-1].bias, self.cfg['inner_init'])
             else:
-                raise NotImplementedError
-            nn.init.constant_(self.outer_light[-2].bias, np.log(0.5))
+                if self.cfg['outer_light_version'] == 'direction':
+                    self.outer_light = make_predictor(72, 3, 256, 4, last_activation='exp', exp_max=self.cfg['light_exp_max'])
+                elif self.cfg['outer_light_version'] == 'sphere_direction':
+                    self.outer_light = make_predictor(72 * 2, 3, 256, 4, last_activation='exp', exp_max=self.cfg['light_exp_max'])
+                else:
+                    raise NotImplementedError
+                nn.init.constant_(self.outer_light[-2].bias, np.log(0.5))
         if self.cfg['human_lights']:
             self.human_light = make_predictor(2 * 2 * 6, 4, 256, 4, last_activation='exp')
             nn.init.constant_(self.human_light[-2].bias, np.log(0.02))
@@ -1041,7 +1161,7 @@ class MCShadingNetwork(nn.Module):
             id_bg_module = torch.rand((1, 512, 1024, self.cfg['indirect_env_size']))
             self.indirect_emb_net = make_predictor(pos_dim, self.cfg['indirect_env_size']*3, 256, 4, last_activation='none')
             self.register_parameter('id_bg_module', nn.Parameter(id_bg_module))
-        else:
+        elif not self.cfg['use_beta']:
             self.inner_light = make_predictor(pos_dim + 72, 3, 256, 4, last_activation='exp', exp_max=self.cfg['inner_light_exp_max'])
             nn.init.constant_(self.inner_light[-2].bias, np.log(0.5))
 
@@ -1219,47 +1339,75 @@ class MCShadingNetwork(nn.Module):
             *shape)
         miss_mask = ~hit_mask
 
-        if self.cfg['direct_light'] and self.cfg['indirect_light']:
-            # hit_mask
-            lights = torch.zeros(*shape, 3)
+        if self.cfg['use_beta']:
             human_lights, human_weights = torch.zeros([1, 3]), torch.zeros([1, 1])
-            if torch.sum(miss_mask) > 0:
-                outer_lights = self.predict_outer_lights(points[miss_mask], directions[miss_mask])
-                if self.cfg['human_lights']:
-                    human_lights, human_weights = self.get_human_light(points[miss_mask], directions[miss_mask],
-                                                                    human_poses[miss_mask])
-                else:
-                    human_lights, human_weights = torch.zeros_like(outer_lights), torch.zeros(outer_lights.shape[0], 1)
-                lights[miss_mask] = outer_lights * (1 - human_weights) + human_lights * human_weights
-
-            if torch.sum(hit_mask) > 0:
-                _, sn = hit_mask.shape
-                # xyz_feat = xyz_feat[:, None, :].repeat(1, sn, 1)
-                xyz_ = self.pos_enc(inters[hit_mask])
-                lights[hit_mask] = self.get_inner_lights(inters[hit_mask], -directions[hit_mask], normals[hit_mask])
-                
-        elif self.cfg['direct_light']:
-            lights = self.predict_outer_lights(points, directions)
-            if self.cfg['human_lights']:
-                human_lights, human_weights = self.get_human_light(points, directions, human_poses)
+            if self.cfg['use_plucker']:
+                # reflective norm should be 1
+                cross = torch.cross(points, directions, dim=-1)
+                # plucker = torch.cat((reflective, cross), dim=-1)
+                plucker_scale = torch.sum(points * directions, dim=-1, keepdim=True)
+                pts_enc = self.pos_enc(cross)
+                directions_enc = self.sph_enc(directions, 0)
+                direct_light, indirect_light, light_alpha, light_beta = self.light_network(directions_enc, pts_enc, plucker_scale)
             else:
-                human_lights, human_weights = torch.zeros_like(outer_lights), torch.zeros(outer_lights.shape[0], 1)
-            lights = lights * (1 - human_weights) + human_lights * human_weights
+                pts_enc = self.pos_enc(points)
+                directions_enc = self.sph_enc(directions, 0)
+                direct_light, indirect_light, light_alpha, light_beta = self.light_network(directions_enc, pts_enc)
             
-        elif self.cfg['indirect_light']:
-            lights = self.get_inner_lights(inters, -directions, normals)
-            if self.cfg['human_lights']:
-                human_lights, human_weights = self.get_human_light(points, directions, human_poses)
-            else:
-                human_lights, human_weights = torch.zeros_like(outer_lights), torch.zeros(outer_lights.shape[0], 1)
-            lights = lights * (1 - human_weights) + human_lights * human_weights
+            light_alpha = torch.sigmoid(light_alpha)
+
+            light_alpha = light_alpha.clone()
+            light_alpha[hit_mask] = 1
+            # one_mask = light_alpha>0.5
+            # light_alpha[one_mask] = light_alpha[one_mask] + (1-light_alpha[one_mask]).detach()
+            # light_alpha[~one_mask] = light_alpha[~one_mask] - (light_alpha[~one_mask]).detach()
+            light_beta = light_alpha * light_beta
+            lights = indirect_light * light_alpha + direct_light * (1-light_alpha)
             
         else:
-            raise
+            light_alpha = None
+            light_beta = None
+            if self.cfg['direct_light'] and self.cfg['indirect_light']:
+                # hit_mask
+                lights = torch.zeros(*shape, 3)
+                human_lights, human_weights = torch.zeros([1, 3]), torch.zeros([1, 1])
+                if torch.sum(miss_mask) > 0:
+                    outer_lights = self.predict_outer_lights(points[miss_mask], directions[miss_mask])
+                    if self.cfg['human_lights']:
+                        human_lights, human_weights = self.get_human_light(points[miss_mask], directions[miss_mask],
+                                                                        human_poses[miss_mask])
+                    else:
+                        human_lights, human_weights = torch.zeros_like(outer_lights), torch.zeros(outer_lights.shape[0], 1)
+                    lights[miss_mask] = outer_lights * (1 - human_weights) + human_lights * human_weights
+
+                if torch.sum(hit_mask) > 0:
+                    _, sn = hit_mask.shape
+                    # xyz_feat = xyz_feat[:, None, :].repeat(1, sn, 1)
+                    xyz_ = self.pos_enc(inters[hit_mask])
+                    lights[hit_mask] = self.get_inner_lights(inters[hit_mask], -directions[hit_mask], normals[hit_mask])
+                    
+            elif self.cfg['direct_light']:
+                lights = self.predict_outer_lights(points, directions)
+                if self.cfg['human_lights']:
+                    human_lights, human_weights = self.get_human_light(points, directions, human_poses)
+                else:
+                    human_lights, human_weights = torch.zeros_like(outer_lights), torch.zeros(outer_lights.shape[0], 1)
+                lights = lights * (1 - human_weights) + human_lights * human_weights
+                
+            elif self.cfg['indirect_light']:
+                lights = self.get_inner_lights(inters, -directions, normals)
+                if self.cfg['human_lights']:
+                    human_lights, human_weights = self.get_human_light(points, directions, human_poses)
+                else:
+                    human_lights, human_weights = torch.zeros_like(outer_lights), torch.zeros(outer_lights.shape[0], 1)
+                lights = lights * (1 - human_weights) + human_lights * human_weights
+                
+            else:
+                raise
 
         near_mask = (depth > eps).float()
         lights = lights * near_mask  # very near surface does not bring lights
-        return lights, human_lights * human_weights, inters, normals, hit_mask
+        return lights, human_lights * human_weights, inters, normals, hit_mask, light_alpha, light_beta
 
     def fresnel_schlick(self, F0, HoV):
         return F0 + (1.0 - F0) * torch.clamp(1.0 - HoV, min=0.0, max=1.0) ** 5.0
@@ -1355,11 +1503,11 @@ class MCShadingNetwork(nn.Module):
         distribution = self.distribution_ggx(NoH, roughness.unsqueeze(1))
         human_poses = human_poses.unsqueeze(1).repeat(1, sn, 1, 1) if human_poses is not None else None
         pts_ = pts.unsqueeze(1).repeat(1, sn, 1)
-        lights, hl, light_pts, light_normals, light_pts_mask = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
-        specular_weights = distribution * geometry / (4 * NoV * probability + 1e-5)
-        specular_lights = lights * specular_weights
+        lights, hl, light_pts, light_normals, light_pts_mask, light_alpha, light_beta = self.get_lights(pts_, directions, human_poses)  # pn,sn,3
+        specular_weights_ = distribution * geometry / (4 * NoV * probability + 1e-5)
+        specular_lights = lights * specular_weights_
         specular_colors = torch.mean(fresnel * specular_lights, 1)
-        specular_weights = specular_weights * fresnel
+        specular_weights = specular_weights_ * fresnel
 
         # diffuse only consider diffuse directions
         kd = (1 - metallic.unsqueeze(1))
@@ -1369,8 +1517,23 @@ class MCShadingNetwork(nn.Module):
 
         colors = diffuse_colors + specular_colors
         colors = linear_to_srgb(colors)
-
+        
         outputs = {}
+        if self.cfg['use_beta']:
+            # light_alpha_influ = light_alpha * specular_weights_.detach() * metallic.unsqueeze(1).detach()
+            # light_alpha_influ[:, :diffuse_num] += light_alpha[:, :diffuse_num] * (1 - metallic.unsqueeze(1).detach())
+            # outputs['alpha'] = light_alpha_influ.mean((-1,-2))
+            # light_beta_influ = light_beta * specular_weights_.detach() * metallic.unsqueeze(1).detach()
+            # light_beta_influ[:, :diffuse_num] += light_beta[:, :diffuse_num] * (1 - metallic.unsqueeze(1).detach())
+            # outputs['beta'] = light_beta_influ.mean((-1,-2))
+            alpha = (light_alpha * specular_weights_.detach() * metallic.unsqueeze(1).detach()).mean((-1,-2))
+            alpha = alpha + (light_alpha[:, :diffuse_num] * (1 - metallic.unsqueeze(1).detach())).mean((-1,-2))
+            outputs['alpha'] = alpha.unsqueeze(-1)
+            beta = (light_beta * specular_weights_.detach() * metallic.unsqueeze(1).detach()).mean((-1,-2))
+            beta = beta + (light_beta[:, :diffuse_num] * (1 - metallic.unsqueeze(1).detach())).mean((-1,-2))
+            outputs['beta'] = beta.unsqueeze(-1)
+
+        
         outputs['albedo'] = albedo
         outputs['roughness'] = roughness
         outputs['metallic'] = metallic

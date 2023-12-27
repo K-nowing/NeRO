@@ -5,6 +5,10 @@ data
 raymarching/build/*
 raymarching/raymarching_mob.egg-info
 raymarching/_raymarching_mob.cpython-310-x86_64-linux-gnu.so
+wandb
+
+configs
+hdr
 
 outputs
 tmp

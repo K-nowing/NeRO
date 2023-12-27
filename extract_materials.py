@@ -13,7 +13,7 @@ def main():
     cfg = load_cfg(flags.cfg)
     network = NeROMaterialRenderer(cfg, False)
 
-    ckpt = torch.load(f'data/model/{cfg["name"]}/model.pth')
+    ckpt = torch.load(f'outputs/model/{cfg["name"]}/model.pth')
     step = ckpt['step']
     network.load_state_dict(ckpt['network_state_dict'])
     network.eval().cuda()
@@ -21,7 +21,7 @@ def main():
     print(f'successfully load {cfg["name"]} step {step}!')
 
     with torch.no_grad():
-        material_dir = f'data/materials/{cfg["name"]}-{step}'
+        material_dir = f'outputs/materials/{cfg["name"]}-{step}'
         Path(material_dir).mkdir(parents=True, exist_ok=True)
         materials = network.predict_materials()
 

@@ -98,6 +98,18 @@ class OccLoss(Loss):
             outputs['loss_occ'] = torch.mean(data_pr['loss_occ']).reshape(1)
         return outputs
 
+class AlphaLoss(Loss):
+    default_cfg = {}
+
+    def __init__(self, cfg):
+        self.cfg = {**self.default_cfg, **cfg}
+
+    def __call__(self, data_pr, data_gt, step, *args, **kwargs):
+        outputs = {}
+        if 'loss_alpha' in data_pr:
+            outputs['loss_alpha'] = torch.mean(data_pr['loss_alpha']) * self.cfg['lambda_alpha']
+        return outputs
+
 
 class InitSDFRegLoss(Loss):
     def __init__(self, cfg):
@@ -154,6 +166,7 @@ name2loss = {
     'eikonal': EikonalLoss,
     'std': StdRecorder,
     'init_sdf_reg': InitSDFRegLoss,
+    'alpha': AlphaLoss,
     'occ': OccLoss,
     'mask': MaskLoss,
 

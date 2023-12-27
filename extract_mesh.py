@@ -33,7 +33,7 @@ def main():
     save_dir = os.path.join(f'outputs/meshes/{cfg["name"]}')
     os.makedirs(save_dir, exist_ok=True)
     output_dir = Path(save_dir)
-    mesh.export(f'{save_dir}/{step}.ply')
+    mesh.export(f'{save_dir}/s{step}_r{flags.resolution}.ply')
 
 
 if __name__ == "__main__":

@@ -78,12 +78,13 @@ class ShapeRenderMetrics(Loss):
         imgs += draw_materials(data_pr, h, w)
 
         # output image
-        data_index = kwargs['data_index']
-        model_name = kwargs['model_name']
-        output_path = Path(f'outputs/train_vis/{model_name}')
-        output_path.mkdir(exist_ok=True, parents=True)
-        imsave(f'{str(output_path)}/{step}-index-{data_index}.jpg', concat_images_list(*imgs, vert=True))
-        return outputs
+        # data_index = kwargs['data_index']
+        # model_name = kwargs['model_name']
+        # output_path = Path(f'outputs/train_vis/{model_name}')
+        # output_path.mkdir(exist_ok=True, parents=True)
+        # imsave(f'{str(output_path)}/{step}-index-{data_index}.jpg', concat_images_list(*imgs, vert=True))
+        result_image = concat_images_list(*imgs, vert=True)
+        return outputs, result_image
 
 
 class MaterialRenderMetrics(Loss):
@@ -102,6 +103,8 @@ class MaterialRenderMetrics(Loss):
 
         additional_keys = ['albedo', 'metallic', 'roughness', 'specular_light', 'specular_color', 'diffuse_light',
                            'diffuse_color']
+        if 'beta' in data_pr:
+            additional_keys += ['alpha', 'beta']
         for k in additional_keys:
             img = color_map_backward(data_pr[k].detach().cpu().numpy())
             if img.shape[-1] == 1: img = np.repeat(img, 3, axis=-1)
@@ -110,12 +113,13 @@ class MaterialRenderMetrics(Loss):
         output_imgs = [concat_images_list(*imgs[:5]), concat_images_list(*imgs[5:])]
 
         # output image
-        data_index = kwargs['data_index']
-        model_name = kwargs['model_name']
-        output_path = Path(f'outputs/train_vis/{model_name}')
-        output_path.mkdir(exist_ok=True, parents=True)
-        imsave(f'{str(output_path)}/{step}-index-{data_index}.jpg', concat_images_list(*output_imgs, vert=True))
-        return outputs
+        # data_index = kwargs['data_index']
+        # model_name = kwargs['model_name']
+        # output_path = Path(f'outputs/train_vis/{model_name}')
+        # output_path.mkdir(exist_ok=True, parents=True)
+        # imsave(f'{str(output_path)}/{step}-index-{data_index}.jpg', concat_images_list(*output_imgs, vert=True))
+        result_image = concat_images_list(*output_imgs, vert=True)
+        return outputs, result_image
 
 
 name2metrics = {

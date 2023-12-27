@@ -92,89 +92,13 @@ def imgs_info_downsample(imgs_info, ratio):
 
 
 class NeROShapeRenderer(nn.Module):
-    default_cfg = {
-        # standard deviation for opacity density
-        'std_net': 'default',
-        'std_act': 'exp',
-        'inv_s_init': 0.3,
-        'freeze_inv_s_step': None,
-
-        # geometry network
-        'sdf_net': 'default',
-        'sdf_activation': 'none',
-        'sdf_bias': 0.5,
-        'sdf_n_layers': 8,
-        'sdf_freq': 6,
-        'sdf_d_out': 257,
-        'geometry_init': True,
-        'hash_encoding': False,
-        'grid_variance': False,
-
-        # shader network
-        'shader_config': {
-            'use_beta': False,
-            },
-        'lambda_occ': 0.01,
-
-        # sampling strategy
-        'raymarching': False,
-        'anneal_end': 50000,
-        
-        ## raymarching
-        'num_rays': 4096 // 8,
-        'max_steps': 1024 // 8, 
-        'num_points': 2**18 // 8,
-        'adaptive_num_rays': True,
-        'grid_size': 128,
-        'bound': 1.0,
-        'scale': 1.0,
-        'offset': [0.0, 0.0, 0.0],
-        'min_near': 0.05,
-        'density_thresh': 0.001,  # for sdf default
-        'trainable_density_grid': False,
-        'lambda_density': 0,
-        'update_extra_interval': 16,
-        ## non raymarching
-        'n_samples': 64,
-        'n_bg_samples': 32,
-        'inf_far': 1000.0,
-        'n_importance': 64,
-        'up_sample_steps': 4,  # 1 for simple coarse-to-fine sampling
-        'perturb': 1.0,
-        'train_ray_num': 512,
-        'test_ray_num': 512,
-        'clip_sample_variance': True,
-
-        # dataset
-        'database_name': 'nerf_synthetic/lego/black_800',
-        'is_blender': False,
-        'use_mask': False,
-
-        # validation
-        'test_downsample_ratio': True,
-        'downsample_ratio': 0.25,
-        'val_geometry': False,
-
-        # losses
-        'rgb_loss': 'charbonier',
-        'apply_occ_loss': True,
-        'occ_loss_step': 20000,
-        'occ_loss_max_pn': 2048,
-        'occ_sdf_thresh': 0.01,
-
-        "fixed_camera": False,
-        
-        # test
-        "mc_shader": False
-    }
-
-    def __init__(self, cfg, fp16=False, training=True):
+    def __init__(self, cfg, database_name, training=True):
         super().__init__()
-        self.cfg = {**self.default_cfg, **cfg}
+        self.cfg = cfg
+        self.database_name = database_name
         self.is_blender = self.cfg['is_blender']
         self.use_mask = True if self.is_blender or self.cfg['use_mask'] else False
         self.hash_encoding = self.cfg['hash_encoding']
-        self.fp16 = fp16
         self.use_beta = self.cfg['shader_config']['use_beta']
 
         if self.hash_encoding:
@@ -197,17 +121,17 @@ class NeROShapeRenderer(nn.Module):
                 self.bound = self.cfg['bound']
             self.max_level = 16
         else:
-            self.sdf_network = SDFNetwork(d_out=self.cfg['sdf_d_out'], d_in=3, d_hidden=256,
-                                        n_layers=self.cfg['sdf_n_layers'],
-                                        skip_in=[self.cfg['sdf_n_layers'] // 2], multires=self.cfg['sdf_freq'],
-                                        bias=self.cfg['sdf_bias'], scale=1.0,
-                                        geometric_init=self.cfg['geometry_init'],
-                                        weight_norm=True, sdf_activation=self.cfg['sdf_activation'])
+            self.sdf_network = SDFNetwork(d_out=self.cfg.sdf['d_out'], d_in=3, d_hidden=256,
+                                        n_layers=self.cfg.sdf['n_layers'],
+                                        skip_in=[self.cfg.sdf['n_layers'] // 2], multires=self.cfg.sdf['freq'],
+                                        bias=self.cfg.sdf['bias'], scale=1.0,
+                                        geometric_init=self.cfg.sdf['geometry_init'],
+                                        weight_norm=True)
 
         if self.cfg['grid_variance']:
-            self.deviation_network = GridVarianceNetwork(init_val=self.cfg['inv_s_init'], activation=self.cfg['std_act'])
+            self.deviation_network = GridVarianceNetwork(init_val=self.cfg['sdf_variance_init'])
         else:
-            self.deviation_network = SingleVarianceNetwork(init_val=self.cfg['inv_s_init'], activation=self.cfg['std_act'])
+            self.deviation_network = SingleVarianceNetwork(init_val=self.cfg['sdf_variance_init'])
 
         # background nerf is a nerf++ model (this is outside the unit bounding sphere, so we call it outer nerf)
         if not self.use_mask:
@@ -218,9 +142,9 @@ class NeROShapeRenderer(nn.Module):
         assert self.cfg['bound'] == 1
         if self.cfg['mc_shader']:
             from network.mcfield import COMShadingNetwork
-            self.color_network = COMShadingNetwork(self.cfg['shader_config'], 1, self.hash_encoding, self.fp16)
+            self.color_network = COMShadingNetwork(self.cfg['shader_config'], None, 1, self.hash_encoding)
         else:
-            self.color_network = AppShadingNetwork(self.cfg['shader_config'], 1, self.hash_encoding, self.fp16)
+            self.color_network = AppShadingNetwork(self.cfg['shader_config'], 1, self.hash_encoding)
         
         self.raymarching = self.cfg['raymarching']
         self.update_extra_interval = self.cfg['update_extra_interval']
@@ -279,6 +203,8 @@ class NeROShapeRenderer(nn.Module):
             self.register_buffer("density_bitfield", density_bitfield)
             self.mean_density = 0
             self.iter_density = 0
+            
+            self.render_step_size = 1.732 * 2 * self.bound / 1024 # self.config.num_samples_per_ray
 
         if training:
             self._init_dataset()
@@ -310,8 +236,8 @@ class NeROShapeRenderer(nn.Module):
 
     def _init_dataset(self, train=True):
         # train/test split
-        if self.cfg['database_name'].split('/')[0] == 'nerf':
-            self.train_database = NeRFSyntheticDatabase(self.cfg['database_name'], self.cfg['dataset_dir'], self.cfg['img_wh'], 'train')
+        if self.database_name.split('/')[0] == 'nerf':
+            self.train_database = NeRFSyntheticDatabase(self.database_name, self.cfg['dataset_dir'], self.cfg['img_wh'], 'train')
             self.train_ids = self.train_database.get_img_ids()
             self.train_ids = np.asarray(self.train_ids)
             
@@ -321,7 +247,7 @@ class NeROShapeRenderer(nn.Module):
             print(f'training size {h} {w} ...')
             self.train_num = len(self.train_ids)
             
-            self.test_database = NeRFSyntheticDatabase(self.cfg['database_name'], self.cfg['dataset_dir'], self.cfg['img_wh'], 'test', val_num=4)
+            self.test_database = NeRFSyntheticDatabase(self.database_name, self.cfg['dataset_dir'], self.cfg['img_wh'], 'test', val_num=4)
             self.test_ids = self.test_database.get_img_ids()
             self.test_ids = np.asarray(self.test_ids)
             self.test_ids = self.test_ids[60:61]
@@ -334,7 +260,7 @@ class NeROShapeRenderer(nn.Module):
             
         else:
             if train:
-                self.train_database = parse_database_name(self.cfg['database_name'], self.cfg['dataset_dir'])
+                self.train_database = parse_database_name(self.database_name, self.cfg['dataset_dir'])
                 self.train_ids, self.test_ids = get_database_split(self.train_database)
                 self.train_ids = np.asarray(self.train_ids)
 
@@ -349,7 +275,7 @@ class NeROShapeRenderer(nn.Module):
                 self.test_imgs_info = imgs_info_to_torch(self.test_imgs_info, 'cpu')
                 self.test_num = len(self.test_ids)
             else:
-                self.test_database = parse_database_name(self.cfg['database_name'], self.cfg['dataset_dir'], split='test')
+                self.test_database = parse_database_name(self.database_name, self.cfg['dataset_dir'], split='test')
                 self.test_ids = self.test_database.get_img_ids()
                 self.test_imgs_info = build_imgs_info(self.test_database, self.test_ids, self.use_mask)
                 self.test_imgs_info = imgs_info_to_torch(self.test_imgs_info, 'cpu')
@@ -403,8 +329,8 @@ class NeROShapeRenderer(nn.Module):
 
         i, j = torch.meshgrid(torch.linspace(0, w - 1, w),
                               torch.linspace(0, h - 1, h))  # pytorch's meshgrid has indexing='ij'
-        i = i.t()
-        j = j.t()
+        i = i.t() + 0.5
+        j = j.t() + 0.5
 
         K = imgs_info['Ks'][0]
         dirs = torch.stack([(i - K[0][2]) / K[0][0], -(j - K[1][2]) / K[1][1], -torch.ones_like(i)], -1)
@@ -582,8 +508,10 @@ class NeROShapeRenderer(nn.Module):
             imgs_info = imgs_info_downsample(imgs_info, self.cfg['downsample_ratio'])
             h, w = gt_depth.shape
             dh, dw = int(self.cfg['downsample_ratio'] * h), int(self.cfg['downsample_ratio'] * w)
-            gt_depth, gt_mask = cv2.resize(gt_depth, (dw, dh), interpolation=cv2.INTER_NEAREST), \
-                cv2.resize(gt_mask.astype(np.uint8), (dw, dh), interpolation=cv2.INTER_NEAREST)
+            # gt_depth, gt_mask = cv2.resize(gt_depth, (dw, dh), interpolation=cv2.INTER_NEAREST), \
+            #     cv2.resize(gt_mask.astype(np.uint8), (dw, dh), interpolation=cv2.INTER_NEAREST)
+            gt_depth, gt_mask = cv2.resize(gt_depth, (dw, dh), interpolation=cv2.INTER_LINEAR), \
+                cv2.resize(gt_mask.astype(np.uint8), (dw, dh), interpolation=cv2.INTER_LINEAR)
         gt_depth, gt_mask = torch.from_numpy(gt_depth), torch.from_numpy(gt_mask.astype(np.int32))
         ray_batch, input_poses, rn, h, w = self._construct_nerf_ray_batch(imgs_info, is_train=False) \
             if is_blender else self._construct_ray_batch(imgs_info, is_train=False)
@@ -654,12 +582,6 @@ class NeROShapeRenderer(nn.Module):
         else:
             rn = self.cfg['train_ray_num']
         is_blender = self.is_blender
-        if bg_mode == 'white':
-            bg_color = 1
-        else:  # random
-            bg_color = torch.rand(
-                rn, 3
-            )  # [rn, 3], pixel-wise random.
             
         # fetch to gpu
         train_ray_batch = {k: v[self.train_batch_i:self.train_batch_i + rn].cuda() for k, v in self.train_batch.items()}
@@ -675,6 +597,13 @@ class NeROShapeRenderer(nn.Module):
         if self.hash_encoding:
             self.max_level = 4 + int(12 * min(1, self.get_anneal_val(step)))
             self.color_network.max_level = self.max_level
+            
+        if bg_mode == 'white':
+            bg_color = 1
+        else:  # random
+            bg_color = torch.rand(
+                rays_o.shape[0], 3
+            )  # [rn, 3], pixel-wise random.
             
         if self.raymarching:
             outputs = self.render_raymarching(rays_o, rays_d, z_vals, human_poses, step=step, is_train=True, bg_color=bg_color)
@@ -698,6 +627,11 @@ class NeROShapeRenderer(nn.Module):
             outputs['loss_rgb'] = self.compute_rgb_loss(outputs['ray_rgb'], gt_color)  # ray_loss
         if self.use_mask:
             outputs['loss_mask'] = F.l1_loss(outputs['acc'], gt_mask[..., 0], reduction='mean')
+            # just_zero_one = (gt_mask[..., 0] == 0) | (gt_mask[..., 0] == 1)
+            # if just_zero_one.sum() > 0:
+            #     outputs['loss_mask'] = torch.mean(torch.abs(outputs['acc'] - gt_mask[..., 0])[just_zero_one])
+            # else:
+            #     outputs['loss_mask'] = 0
         return outputs
 
     # def render_step(self, step):
@@ -921,8 +855,7 @@ class NeROShapeRenderer(nn.Module):
         if len(xyzs_) == 0:
             return torch.zeros_like(rays_o[...,:1])
         
-        with torch.cuda.amp.autocast(enabled=self.fp16):
-            sdfs = self.get_sdf(xyzs_)[...,0]    
+        sdfs = self.get_sdf(xyzs_)[...,0]    
         raw_normals = self.get_sdf_gradient(xyzs_)
         normals = safe_normalize(raw_normals, dim=-1)
         dirs = safe_normalize(dirs[inside_mask], dim=-1)
@@ -963,7 +896,7 @@ class NeROShapeRenderer(nn.Module):
             inv_s = self.deviation_network(points).clip(1e-6, 1e6)  # ...,1
             inv_s = inv_s[..., 0]
 
-        if self.cfg['freeze_inv_s_step'] is not None and step < self.cfg['freeze_inv_s_step']:
+        if step < self.cfg['freeze_inv_s_step']:
             inv_s = inv_s.detach()
 
         true_cos = (dirs * gradients).sum(-1)  # [...]
@@ -1045,75 +978,75 @@ class NeROShapeRenderer(nn.Module):
         alpha, sampled_color = torch.zeros(batch_size, n_samples), torch.zeros(batch_size, n_samples, 3)
         light_beta = torch.zeros(batch_size, n_samples, beta_dim)
 
-        with torch.cuda.amp.autocast(enabled=self.fp16):
-            if torch.sum(outer_mask) > 0:
-                if use_mask:
-                    alpha[outer_mask] = torch.zeros_like(alpha[outer_mask])
-                    sampled_color[outer_mask] = torch.zeros_like(sampled_color[outer_mask])
-                else:
-                    alpha[outer_mask], sampled_color[outer_mask] = self.compute_density_alpha(points[outer_mask],
-                                                                                            dists[outer_mask],
-                                                                                            -dirs[outer_mask],
-                                                                                            self.outer_nerf)
 
-            if torch.sum(inner_mask) > 0:
-                alpha[inner_mask], gradients, feature_vector, inv_s, sdf = self.compute_sdf_alpha(points[inner_mask],
-                                                                                                dists[inner_mask],
-                                                                                                dirs[inner_mask],
-                                                                                                cos_anneal_ratio, step)
-                if self.hash_encoding:
-                    feature_vector = None
-                sampled_color[inner_mask], occ_info = self.color_network(points[inner_mask], gradients, -dirs[inner_mask],
-                                                                        human_poses_pt[inner_mask], feature_vector, 
-                                                                        step=step)
-                if self.use_beta:
-                    light_beta[inner_mask] = occ_info['light_beta']
-                # Eikonal loss
-                gradient_error = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
-            else:
-                gradient_error = torch.zeros(1)
-
-            weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[...,
-                            :-1]  # rn,sn
-            color = (sampled_color * weights[..., None]).sum(dim=1)
-            if self.use_beta:
-                beta = (light_beta * weights[..., None]).sum(dim=1) + self.cfg['shader_config']['beta_min']
-            else:
-                beta = None
-            acc = torch.sum(weights, -1)
+        if torch.sum(outer_mask) > 0:
             if use_mask:
-                color = color + (1. - acc[..., None]) * bg_color
-
-            outputs = {
-                'ray_rgb': color,  # rn,3
-                'ray_beta': beta,
-                'gradient_error': gradient_error,  # rn
-                'acc': acc,  # rn
-            }
-                
-
-            if torch.sum(inner_mask) > 0:
-                outputs['std'] = torch.mean(1 / inv_s)
+                alpha[outer_mask] = torch.zeros_like(alpha[outer_mask])
+                sampled_color[outer_mask] = torch.zeros_like(sampled_color[outer_mask])
             else:
-                outputs['std'] = torch.zeros(1)
+                alpha[outer_mask], sampled_color[outer_mask] = self.compute_density_alpha(points[outer_mask],
+                                                                                        dists[outer_mask],
+                                                                                        -dirs[outer_mask],
+                                                                                        self.outer_nerf)
 
-            if step < 1000:
-                mask = torch.norm(points, dim=-1) < 1.2
-                outputs['sdf_pts'] = points[mask]
+        if torch.sum(inner_mask) > 0:
+            alpha[inner_mask], gradients, feature_vector, inv_s, sdf = self.compute_sdf_alpha(points[inner_mask],
+                                                                                            dists[inner_mask],
+                                                                                            dirs[inner_mask],
+                                                                                            cos_anneal_ratio, step)
+            if self.hash_encoding:
+                feature_vector = None
+            sampled_color[inner_mask], occ_info = self.color_network(points[inner_mask], gradients, -dirs[inner_mask],
+                                                                    human_poses_pt[inner_mask], feature_vector, 
+                                                                    step=step)
+            if self.use_beta:
+                light_beta[inner_mask] = occ_info['light_beta']
+            # Eikonal loss
+            gradient_error = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
+        else:
+            gradient_error = torch.zeros(1)
 
-            if self.cfg['apply_occ_loss']:
-                # occlusion loss
-                if torch.sum(inner_mask) > 0:
-                    if self.cfg['shader_config']['use_beta']:  # l1 reg
-                        outputs['loss_occ'] = self.cfg['lambda_occ'] * occ_info['occ_prob']
-                    else: # gt_occ supervision
-                        outputs['loss_occ'] = self.compute_occ_loss(occ_info, points[inner_mask], sdf, gradients,
-                                                                    dirs[inner_mask], step)
-                else:
-                    outputs['loss_occ'] = torch.zeros(1)
+        weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[...,
+                        :-1]  # rn,sn
+        color = (sampled_color * weights[..., None]).sum(dim=1)
+        if self.use_beta:
+            beta = (light_beta * weights[..., None]).sum(dim=1) + self.cfg['beta_min']
+        else:
+            beta = None
+        acc = torch.sum(weights, -1)
+        if use_mask:
+            color = color + (1. - acc[..., None]) * bg_color
 
-            if not is_train:
-                outputs.update(self.compute_validation_info(z_vals, rays_o, rays_d, weights, human_poses, step))
+        outputs = {
+            'ray_rgb': color,  # rn,3
+            'ray_beta': beta,
+            'gradient_error': gradient_error,  # rn
+            'acc': acc,  # rn
+        }
+            
+
+        if torch.sum(inner_mask) > 0:
+            outputs['std'] = torch.mean(1 / inv_s)
+        else:
+            outputs['std'] = torch.zeros(1)
+
+        if step < 1000:
+            mask = torch.norm(points, dim=-1) < 1.2
+            outputs['sdf_pts'] = points[mask]
+
+        if self.cfg['apply_occ_loss']:
+            # occlusion loss
+            if torch.sum(inner_mask) > 0:
+                if self.cfg['shader_config']['use_beta']:  # l1 reg
+                    outputs['loss_alpha'] = occ_info['occ_prob']
+                else: # gt_occ supervision
+                    outputs['loss_occ'] = self.compute_occ_loss(occ_info, points[inner_mask], sdf, gradients,
+                                                                dirs[inner_mask], step)
+            else:
+                outputs['loss_occ'] = torch.zeros(1)
+
+        if not is_train:
+            outputs.update(self.compute_validation_info(z_vals, rays_o, rays_d, weights, human_poses, step))
 
         return outputs
     
@@ -1151,7 +1084,7 @@ class NeROShapeRenderer(nn.Module):
                 alpha, sampled_color_beta, ts, rays, T_thresh, True
             )
             color = color_beta[..., :3]
-            beta = color_beta[..., 3:] + self.cfg['shader_config']['beta_min']
+            beta = color_beta[..., 3:] + self.cfg['beta_min']
         else:
             weights, acc, depth, color = raymarching.composite_rays_train(
                 alpha, sampled_color, ts, rays, T_thresh, True
@@ -1170,7 +1103,7 @@ class NeROShapeRenderer(nn.Module):
         if not is_train:
             outputs['depth'] = depth
             if self.use_beta:
-                outputs['beta_img'] = outputs['ray_beta'] - self.cfg['shader_config']['beta_min']
+                outputs['beta_img'] = outputs['ray_beta'] - self.cfg['beta_min']
             outputs.update(self.compute_validation_info(None, rays_o, rays_d, weights, human_poses, step, depth=depth.unsqueeze(-1)))
         return outputs
     
@@ -1190,14 +1123,13 @@ class NeROShapeRenderer(nn.Module):
         if torch.sum(outer_mask) > 0:
             raise
         if torch.sum(inner_mask) > 0:
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                alpha[inner_mask], gradients, feature_vector, inv_s, sdf = self.compute_sdf_alpha(points[inner_mask],
-                                                                                                dists[inner_mask],
-                                                                                                dirs[inner_mask],
-                                                                                                cos_anneal_ratio, step)
-                sampled_color[inner_mask], occ_info = self.color_network(points[inner_mask], gradients, -dirs[inner_mask],
-                                                                        human_poses_pt, feature_vector, 
-                                                                        step=step)
+            alpha[inner_mask], gradients, feature_vector, inv_s, sdf = self.compute_sdf_alpha(points[inner_mask],
+                                                                                            dists[inner_mask],
+                                                                                            dirs[inner_mask],
+                                                                                            cos_anneal_ratio, step)
+            sampled_color[inner_mask], occ_info = self.color_network(points[inner_mask], gradients, -dirs[inner_mask],
+                                                                    human_poses_pt, feature_vector, 
+                                                                    step=step)
             # Eikonal loss
             outputs['gradient_error'] = (torch.linalg.norm(gradients, ord=2, dim=-1) - 1.0) ** 2
             outputs['std'] = torch.mean(1 / inv_s)
@@ -1313,13 +1245,22 @@ class NeROShapeRenderer(nn.Module):
                                 torch.rand_like(cas_xyzs) * 2 - 1
                             ) * half_grid_size
                             # query density
-                            with torch.cuda.amp.autocast(enabled=self.fp16):
-                                sdfs = self.get_sdf(cas_xyzs).reshape(-1).detach()
-                                if self.cfg['grid_variance']:
-                                    inv_s = self.deviation_network(cas_xyzs).clamp(1e-6, 1e6)
-                                else:
-                                    inv_s = self.deviation_network(sdfs).clamp(1e-6, 1e6)
-                                sdfs = torch.sigmoid(-sdfs * inv_s) * inv_s
+                            sdfs = self.get_sdf(cas_xyzs).reshape(-1).detach()
+                            if self.cfg['grid_variance']:
+                                inv_s = self.deviation_network(cas_xyzs).clamp(1e-6, 1e6)
+                            else:
+                                inv_s = self.deviation_network(sdfs).clamp(1e-6, 1e6)
+                            sdfs = torch.sigmoid(-sdfs * inv_s) * inv_s
+                            
+                            # estimated_next_sdf = sdfs[..., None] - self.render_step_size * 0.5
+                            # estimated_prev_sdf = sdfs[..., None] + self.render_step_size * 0.5
+                            # prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+                            # next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+                            # p = prev_cdf - next_cdf
+                            # c = prev_cdf
+                            # alpha = ((p + 1e-5) / (c + 1e-5)).view(-1, 1).clip(0.0, 1.0)
+                            # sdfs = alpha[..., 0]
+                            
                             # assign
                             tmp_grid[cas, indices] = sdfs
 
@@ -1407,14 +1348,19 @@ class NeROMaterialRenderer(nn.Module):
         'reg_diffuse_light': True,
         'reg_diffuse_light_lambda': 0.1,
         'fixed_camera': False,
+        
+        'lambda_occ': 0.01,
+        'beta_min': 0.2,
     }
 
-    def __init__(self, cfg, fp16=False, train=True):
+    def __init__(self, cfg, database_name, train=True):
         self.cfg = {**self.default_cfg, **cfg}
+        self.database_name = database_name
         super().__init__()
         self.warned_normal = False
         self.is_blender = self.cfg['is_blender']
         self.use_mask = True if self.is_blender or self.cfg['use_mask'] else False
+        self.use_beta = self.cfg['shader_cfg']['use_beta']
         self._init_geometry()
         self._init_dataset(train)
         self._init_shader()
@@ -1425,12 +1371,12 @@ class NeROMaterialRenderer(nn.Module):
 
     def _init_dataset(self, train):
         # train/test split
-        if self.cfg['database_name'].split('/')[0] == 'nerf':
-            self.train_database = NeRFSyntheticDatabase(self.cfg['database_name'], self.cfg['dataset_dir'], self.cfg['img_wh'], 'train')
+        if self.database_name.split('/')[0] == 'nerf':
+            self.train_database = NeRFSyntheticDatabase(self.database_name, self.cfg['dataset_dir'], self.cfg['img_wh'], 'train')
             self.train_ids = self.train_database.get_img_ids()
             self.train_ids = np.asarray(self.train_ids)
             
-            self.test_database = NeRFSyntheticDatabase(self.cfg['database_name'], self.cfg['dataset_dir'], self.cfg['img_wh'], 'test', val_num=4)
+            self.test_database = NeRFSyntheticDatabase(self.database_name, self.cfg['dataset_dir'], self.cfg['img_wh'], 'test', val_num=4)
             self.test_ids = self.test_database.get_img_ids()
             self.test_ids = np.asarray(self.test_ids)
             self.test_ids = self.test_ids[60:61]
@@ -1449,7 +1395,7 @@ class NeROMaterialRenderer(nn.Module):
                 self._shuffle_train_batch()
         else:
                 
-            self.database = parse_database_name(self.cfg['database_name'], self.cfg['dataset_dir'])
+            self.database = parse_database_name(self.database_name, self.cfg['dataset_dir'])
             self.train_ids, self.test_ids = get_database_split(self.database, 'validation')
             self.train_ids = np.asarray(self.train_ids)
 
@@ -1468,7 +1414,7 @@ class NeROMaterialRenderer(nn.Module):
                 self._shuffle_train_batch()
 
     def _init_shader(self):
-        self.cfg['shader_cfg']['is_real'] = self.cfg['database_name'].startswith('real')
+        self.cfg['shader_cfg']['is_real'] = self.database_name.startswith('real')
         self.shader_network = MCShadingNetwork(self.cfg['shader_cfg'], lambda o, d: self.trace(o, d))
 
     def trace_in_batch(self, rays_o, rays_d, batch_size=1024 ** 2, cpu=False):
@@ -1583,8 +1529,8 @@ class NeROMaterialRenderer(nn.Module):
 
         i, j = torch.meshgrid(torch.linspace(0, w - 1, w),
                               torch.linspace(0, h - 1, h))  # pytorch's meshgrid has indexing='ij'
-        i = i.t()
-        j = j.t()
+        i = i.t() + 0.5
+        j = j.t() + 0.5
 
         K = imgs_info['Ks'][0]
         dirs = torch.stack([(i - K[0][2]) / K[0][0], -(j - K[1][2]) / K[1][1], -torch.ones_like(i)], -1)
@@ -1670,7 +1616,14 @@ class NeROMaterialRenderer(nn.Module):
 
         shade_outputs = self.shade(pts, view_dirs, normals, human_poses, True, step)
         shade_outputs['rgb_gt'] = rgb_gt
-        shade_outputs['loss_rgb'] = self.compute_rgb_loss(shade_outputs['rgb_pr'], shade_outputs['rgb_gt'])
+        if self.use_beta:
+            beta = shade_outputs['beta'] + self.cfg['beta_min']
+            loss = ((shade_outputs['rgb_pr']-shade_outputs['rgb_gt'])**2/(2*beta**2))
+            loss += 3 + torch.log(beta) # +3
+            shade_outputs['loss_rgb'] = loss
+            shade_outputs['loss_alpha'] = shade_outputs['alpha']
+        else:
+            shade_outputs['loss_rgb'] = self.compute_rgb_loss(shade_outputs['rgb_pr'], shade_outputs['rgb_gt'])
         if self.cfg['reg_mat']:
             shade_outputs['loss_mat_reg'] = self.shader_network.material_regularization(
                 pts, normals, shade_outputs['metallic'], shade_outputs['roughness'], shade_outputs['albedo'], step)
@@ -1691,7 +1644,7 @@ class NeROMaterialRenderer(nn.Module):
         trn = self.cfg['test_ray_num']
 
         output_keys = {'rgb_gt': 3, 'rgb_pr': 3, 'specular_light': 3, 'specular_color': 3, 'diffuse_light': 3,
-                       'diffuse_color': 3, 'albedo': 3, 'metallic': 1, 'roughness': 1}
+                       'diffuse_color': 3, 'albedo': 3, 'metallic': 1, 'roughness': 1, 'alpha': 1, 'beta':1}
         outputs = {k: [] for k in output_keys.keys()}
         rn = ray_batch['rays_o'].shape[0]
         for ri in range(0, rn, trn):
@@ -1716,6 +1669,10 @@ class NeROMaterialRenderer(nn.Module):
                 outputs_cur['metallic'][hit_mask] = shade_outputs['metallic']
                 outputs_cur['roughness'][hit_mask] = torch.sqrt(
                     shade_outputs['roughness'])  # note: we assume predictions are roughness squared
+                
+                if self.use_beta:
+                    outputs_cur['alpha'][hit_mask] = shade_outputs['alpha']
+                    outputs_cur['beta'][hit_mask] = shade_outputs['beta']
 
             for k in output_keys.keys():
                 outputs[k].append(outputs_cur[k])
