@@ -149,11 +149,12 @@ class Trainer:
                     loss += loss_
                     log_info[key] = loss_.item()
                     
-            if outputs['std'] == 0:
-                inv_s = -1
-            else:
-                inv_s = (1 / outputs['std']).item()
-            log_info['train/inv_s'] = inv_s
+            if 'std' in outputs:  # for shape network
+                if outputs['std'] == 0:
+                    inv_s = -1
+                else:
+                    inv_s = (1 / outputs['std']).item()
+                log_info['train/inv_s'] = inv_s
 
             loss.backward()
             self.optimizer.step()
@@ -204,7 +205,7 @@ class Trainer:
                 save_fn = None
                 self._save_model(step + 1, best_para, save_fn=save_fn)
 
-            pbar.set_postfix(loss=float(loss.detach().cpu().numpy()), lr=lr, inv_s=inv_s)
+            pbar.set_postfix(loss=float(loss.detach().cpu().numpy()), lr=lr)
             pbar.update(1)
             del loss, log_info
 

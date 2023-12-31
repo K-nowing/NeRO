@@ -513,7 +513,7 @@ def make_predictor(inputs_dim: int, output_dim: int, hidden_dim: int, layer_num:
         last_activation = IdentityActivation()
     elif last_activation == 'relu':
         last_activation = nn.ReLU(True)
-    elif last_activation == 'relu':
+    elif last_activation == 'softplus':
         last_activation = nn.Softplus()
     else:
         raise NotImplementedError
@@ -730,22 +730,26 @@ class AppShadingNetwork(nn.Module):
         if self.hash_encoding:
             self.bound = bound
             self.max_level = 16
-            # self.encoder_material, in_dim_material = get_encoder(
-            #     "hashgrid_tcnn" if True else "hashgrid",
-            #     level_dim=2,
-            #     desired_resolution=2048 * self.bound,
-            #     interpolation="smoothstep",
-            # )
-            # self.albedo_predictor = make_predictor(in_dim_material + 3, 3, 64, 3)
-            # self.metallic_predictor = make_predictor(in_dim_material + 3, 1, 64, 3)
-            # if self.cfg['metallic_init'] != 0:
-            #     nn.init.constant_(self.metallic_predictor[-2].bias, self.cfg['metallic_init'])
-            # self.roughness_predictor = make_predictor(in_dim_material + 3, 1, 64, 3)
-            # if self.cfg['roughness_init'] != 0:
-            #     nn.init.constant_(self.roughness_predictor[-2].bias, self.cfg['roughness_init'])
+            
+            self.encoder_material, in_dim_material = get_encoder(
+                "hashgrid_tcnn" if True else "hashgrid",
+                level_dim=2,
+                desired_resolution=2048 * self.bound,
+                interpolation="smoothstep",
+            )
+            self.albedo_predictor = make_predictor(in_dim_material + 3, 3, 64, 3)
+            self.metallic_predictor = make_predictor(in_dim_material + 3, 1, 64, 3)
+            if self.cfg['metallic_init'] != 0:
+                nn.init.constant_(self.metallic_predictor[-2].bias, self.cfg['metallic_init'])
+            self.roughness_predictor = make_predictor(in_dim_material + 3, 1, 64, 3)
+            if self.cfg['roughness_init'] != 0:
+                nn.init.constant_(self.roughness_predictor[-2].bias, self.cfg['roughness_init'])
+            if self.cfg['use_color_beta']:
+                _, dir_dim = get_embedder(6, 3)
+                self.indirect_color_predictor = make_predictor(in_dim_material + 3 + dir_dim, 5, 256, 4, last_activation='none')
                 
-            self.pos_enc, pos_dim = get_embedder(self.cfg['light_pos_freq'], 3)
-            self.material_net = MaterialNetwork(pos_dim)
+            # self.pos_enc, pos_dim = get_embedder(self.cfg['light_pos_freq'], 3)
+            # self.material_net = MaterialNetwork(pos_dim)
         else:
             feats_dim = 256
             self.albedo_predictor = make_predictor(feats_dim + 3, 3, 256, 4)
@@ -1011,9 +1015,9 @@ class AppShadingNetwork(nn.Module):
 
     def predict_materials(self, points, features=None, reflective=None):
         if self.hash_encoding:
-            # h = self.encoder_material(points, bound=self.bound, max_level=self.max_level)
-            # h = torch.cat([points, h], dim=-1)
-            return self.material_net(self.pos_enc(points))
+            h = self.encoder_material(points, bound=self.bound, max_level=self.current_level)
+            h = torch.cat([points, h], dim=-1)
+            # return self.material_net(self.pos_enc(points))
         else:
             h = torch.cat([points, features], dim=-1)
         albedo = self.albedo_predictor(h)
@@ -1353,6 +1357,31 @@ class MCShadingNetwork(nn.Module):
                 pts_enc = self.pos_enc(points)
                 directions_enc = self.sph_enc(directions, 0)
                 direct_light, indirect_light, light_alpha, light_beta = self.light_network(directions_enc, pts_enc)
+                
+            # if self.cfg['use_plucker']:
+            #     if torch.sum(miss_mask) > 0:
+            #         m_cross = torch.cross(points[miss_mask], directions[miss_mask], dim=-1)
+            #         # plucker = torch.cat((reflective, cross), dim=-1)
+            #         m_plucker_scale = torch.sum(points[miss_mask] * directions[miss_mask], dim=-1, keepdim=True)
+            #         m_pts_enc = self.pos_enc(m_cross)
+            #         m_directions_enc = self.sph_enc(directions[miss_mask], 0)
+            #         direct_light[miss_mask], indirect_light[miss_mask], light_alpha[miss_mask], light_beta[miss_mask] = self.light_network(m_directions_enc, m_pts_enc, m_plucker_scale)
+            #     if torch.sum(hit_mask) > 0:
+            #         h_cross = torch.cross(inters[hit_mask], -directions[hit_mask], dim=-1)
+            #         # plucker = torch.cat((reflective, cross), dim=-1)
+            #         h_plucker_scale = torch.sum(inters[hit_mask] * -directions[hit_mask], dim=-1, keepdim=True)
+            #         h_pts_enc = self.pos_enc(h_cross)
+            #         h_directions_enc = self.sph_enc(-directions[hit_mask], 0)
+            #         direct_light[hit_mask], indirect_light[hit_mask], light_alpha[hit_mask], light_beta[hit_mask] = self.light_network(h_directions_enc, h_pts_enc, h_plucker_scale)
+            # else:
+            #     if torch.sum(miss_mask) > 0:
+            #         m_pts_enc = self.pos_enc(points[miss_mask])
+            #         m_directions_enc = self.sph_enc(directions[miss_mask], 0)
+            #         direct_light[miss_mask], indirect_light[miss_mask], light_alpha[miss_mask], light_beta[miss_mask] = self.light_network(m_directions_enc, m_pts_enc)
+            #     if torch.sum(hit_mask) > 0:
+            #         h_pts_enc = self.pos_enc(inters[hit_mask])
+            #         h_directions_enc = self.sph_enc(-directions[miss_mask], 0)
+            #         direct_light[hit_mask], indirect_light[hit_mask], light_alpha[hit_mask], light_beta[hit_mask] = self.light_network(h_directions_enc, h_pts_enc)
             
             light_alpha = torch.sigmoid(light_alpha)
 
